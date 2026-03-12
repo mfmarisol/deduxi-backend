@@ -214,58 +214,74 @@ app.post('/api/arca/start', async (req, res) => {
     }))).catch(() => []);
     console.log('[start] inputs on page:', JSON.stringify(pageInputs));
 
-    // 7. Get CAPTCHA image — ARCA embeds it as a data URL directly in the page
-    const captchaData = await page.evaluate(async () => {
-      // Find the captcha image element (alt='Captcha' on ARCA)
+    // 7. Check if password field is visible (we're on the clave page)
+    const pageState = await page.evaluate(() => {
+      const passEl = document.getElementById('F1:password');
+      const hasPassword = passEl && passEl.offsetWidth > 0;
+
+      // Look for captcha image
       const img = document.querySelector('img[alt*="aptcha"]') ||
                   document.querySelector('img[alt*="APTCHA"]') ||
                   document.querySelector('img[alt="Captcha"]') ||
                   document.querySelector('img[src*="captcha"]') ||
                   document.querySelector('img[src*="Captcha"]');
-      if (!img) return {
-        ok: false,
-        msg: 'captcha img not found',
-        imgs: Array.from(document.querySelectorAll('img')).map(i => ({ src: i.src.slice(0, 100), alt: i.alt }))
-      };
 
-      // If already a data URL (ARCA embeds it directly), return it immediately
-      if (img.src.startsWith('data:')) return { ok: true, dataUrl: img.src };
+      const hasCaptchaImg = !!img;
+      const captchaSrc = img ? img.src : null;
 
-      // Otherwise fetch with session cookies
-      try {
-        const resp = await fetch(img.src, { credentials: 'include' });
-        if (!resp.ok) return { ok: false, msg: `fetch failed: ${resp.status}` };
-        const blob = await resp.blob();
-        return await new Promise(resolve => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve({ ok: true, dataUrl: reader.result });
-          reader.onerror = () => resolve({ ok: false, msg: 'FileReader error' });
-          reader.readAsDataURL(blob);
-        });
-      } catch (e) {
-        return { ok: false, msg: 'fetch error: ' + e.message };
-      }
+      // Check for visible captcha input
+      const captchaInput = document.getElementById('F1:captchaSolutionInput') ||
+                           document.querySelector('input[id*="captcha"][type="text"]');
+      const hasCaptchaInput = !!(captchaInput && captchaInput.offsetWidth > 0);
+
+      return { hasPassword, hasCaptchaImg, hasCaptchaInput, captchaSrc };
     });
 
-    console.log('[start] captcha fetch result ok:', captchaData.ok, 'msg:', captchaData.msg || '', 'imgs:', JSON.stringify(captchaData.imgs || []));
-    if (!captchaData.ok) {
+    console.log('[start] page state:', JSON.stringify(pageState));
+
+    if (!pageState.hasPassword) {
       await browser.close();
       return res.json({
         ok: false,
-        error: 'captcha_no_encontrado',
-        msg: 'No se pudo capturar la imagen del CAPTCHA de ARCA. ' + (captchaData.msg || ''),
+        error: 'error_conexion',
+        msg: 'No apareció la pantalla de clave fiscal. Verificá que el CUIT esté registrado en ARCA.',
       });
     }
-
-    const captchaDataUrl = captchaData.dataUrl;
-    console.log('[start] captcha captured, size:', captchaDataUrl.length);
 
     // 8. Store session
     const sessionId = uuidv4();
     sessions.set(sessionId, { browser, page, createdAt: Date.now() });
 
-    console.log(`[start] session ${sessionId} created`);
-    res.json({ ok: true, sessionId, captcha: captchaDataUrl });
+    // Case A: NO CAPTCHA — ARCA skips it for some users
+    if (!pageState.hasCaptchaImg) {
+      console.log(`[start] session ${sessionId} created — NO CAPTCHA flow`);
+      return res.json({ ok: true, sessionId, captcha: null, noCaptcha: true });
+    }
+
+    // Case B: WITH CAPTCHA — get the image
+    let captchaDataUrl = null;
+    if (pageState.captchaSrc && pageState.captchaSrc.startsWith('data:')) {
+      captchaDataUrl = pageState.captchaSrc; // already embedded as data URL
+    } else if (pageState.captchaSrc) {
+      // Fetch with session cookies
+      captchaDataUrl = await page.evaluate(async (src) => {
+        try {
+          const resp = await fetch(src, { credentials: 'include' });
+          if (!resp.ok) return null;
+          const blob = await resp.blob();
+          return await new Promise(resolve => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = () => resolve(null);
+            reader.readAsDataURL(blob);
+          });
+        } catch (_) { return null; }
+      }, pageState.captchaSrc);
+    }
+
+    console.log('[start] captcha captured, size:', captchaDataUrl ? captchaDataUrl.length : 0);
+    console.log(`[start] session ${sessionId} created — WITH CAPTCHA flow`);
+    res.json({ ok: true, sessionId, captcha: captchaDataUrl, noCaptcha: false });
 
   } catch (err) {
     if (browser) browser.close().catch(() => {});
@@ -291,7 +307,7 @@ app.post('/api/arca/complete', async (req, res) => {
   const { browser, page } = s;
 
   try {
-    // Fill password and captcha via page.evaluate to avoid Puppeteer type issues
+    // Fill password (and captcha if present) via page.evaluate
     const filled = await page.evaluate((clave, captcha) => {
       const passEl = document.getElementById('F1:password') ||
                      document.querySelector('input[type="password"]') ||
@@ -301,16 +317,20 @@ app.post('/api/arca/complete', async (req, res) => {
       passEl.dispatchEvent(new Event('input', { bubbles: true }));
       passEl.dispatchEvent(new Event('change', { bubbles: true }));
 
-      const captchaEl = document.getElementById('F1:captchaSolutionInput') ||
-                        document.querySelector('input[name*="captcha"]') ||
-                        document.querySelector('input[id*="captcha"]');
-      if (!captchaEl) return { ok: false, msg: 'captcha field not found' };
-      captchaEl.value = captcha;
-      captchaEl.dispatchEvent(new Event('input', { bubbles: true }));
-      captchaEl.dispatchEvent(new Event('change', { bubbles: true }));
+      // Captcha field is optional — some ARCA users don't get a CAPTCHA
+      if (captcha) {
+        const captchaEl = document.getElementById('F1:captchaSolutionInput') ||
+                          document.querySelector('input[id*="captcha"][type="text"]') ||
+                          document.querySelector('input[name*="captcha"]');
+        if (captchaEl) {
+          captchaEl.value = captcha;
+          captchaEl.dispatchEvent(new Event('input', { bubbles: true }));
+          captchaEl.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
 
       return { ok: true };
-    }, clave, captchaSolution.trim());
+    }, clave, captchaSolution ? captchaSolution.trim() : null);
 
     console.log('[complete] fill result:', JSON.stringify(filled));
     if (!filled.ok) throw new Error(filled.msg);
