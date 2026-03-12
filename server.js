@@ -202,24 +202,17 @@ app.post('/api/arca/start', async (req, res) => {
       return res.json({ ok: false, error: 'cuit_no_encontrado', msg: errText });
     }
 
-    // 6. Wait for captcha solution input (confirms we're on the password page)
-    const captchaInputResult = await findElement(page, [
-      '#F1\\:captchaSolutionInput',
-      'input[id*="captcha"]',
-      'input[name*="captcha"]',
-      'input[placeholder*="aptcha"]',
-    ], { timeout: 15000 });
+    // 6. Wait a bit more and check what page we're on
+    await sleep(2000);
+    const pageUrl = page.url();
+    const pageTitle = await page.title().catch(() => '');
+    console.log('[start] page after Siguiente - url:', pageUrl, 'title:', pageTitle);
 
-    if (!captchaInputResult) {
-      const shot = await debugShot(page);
-      console.error('[start] captcha input not found. URL:', page.url());
-      await browser.close();
-      return res.json({
-        ok: false,
-        error: 'error_conexion',
-        msg: 'No apareció la pantalla de clave fiscal. Verificá que el CUIT esté registrado en ARCA.',
-      });
-    }
+    // Log all inputs on the current page for debugging
+    const pageInputs = await page.$$eval('input', els => els.map(el => ({
+      id: el.id, name: el.name, type: el.type, visible: el.offsetWidth > 0
+    }))).catch(() => []);
+    console.log('[start] inputs on page:', JSON.stringify(pageInputs));
 
     // 7. Get CAPTCHA image via fetch in page context (avoids ElementHandle.screenshot issues)
     const captchaData = await page.evaluate(async () => {
@@ -249,7 +242,7 @@ app.post('/api/arca/start', async (req, res) => {
       }
     });
 
-    console.log('[start] captcha fetch result ok:', captchaData.ok, 'msg:', captchaData.msg || '');
+    console.log('[start] captcha fetch result ok:', captchaData.ok, 'msg:', captchaData.msg || '', 'imgs:', JSON.stringify(captchaData.imgs || []));
     if (!captchaData.ok) {
       await browser.close();
       return res.json({
@@ -492,6 +485,50 @@ app.get('/debug/arca', async (_, res) => {
     const url = page.url();
     await browser.close();
     res.json({ ok: true, title, url, inputs, shot });
+  } catch (err) {
+    if (browser) browser.close().catch(() => {});
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+/* ── Debug: navigate ARCA with CUIT and show step-2 page inputs ── */
+app.get('/debug/arca-step2', async (req, res) => {
+  const cuitRaw = (req.query.cuit || '20123456789').replace(/\D/g, '');
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 900 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36');
+
+    await page.goto('https://auth.afip.gob.ar/contribuyente_/login.xhtml', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await sleep(2000);
+
+    // Fill CUIT and click Siguiente
+    await page.evaluate((cuit) => {
+      const el = document.getElementById('F1:username') || document.querySelector('input[type="number"]');
+      if (el) { el.value = cuit; el.dispatchEvent(new Event('change', { bubbles: true })); }
+      const btn = document.getElementById('F1:btnSiguiente') || document.querySelector('input[type="submit"]');
+      if (btn) btn.click();
+    }, cuitRaw);
+
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
+    await sleep(3000);
+
+    const url = page.url();
+    const title = await page.title();
+    const shot = await page.screenshot({ encoding: 'base64' });
+    const inputs = await page.$$eval('input', els => els.map(el => ({
+      id: el.id, name: el.name, type: el.type, placeholder: el.placeholder,
+      visible: el.offsetWidth > 0 && el.offsetHeight > 0,
+    })));
+    const imgs = await page.$$eval('img', els => els.map(el => ({
+      src: el.src.slice(0, 80), alt: el.alt, width: el.naturalWidth, height: el.naturalHeight,
+    })));
+    const errMsg = await page.$eval('#F1\\:msg', el => el.textContent.trim()).catch(() => '');
+
+    await browser.close();
+    res.json({ ok: true, url, title, inputs, imgs, errMsg, shot });
   } catch (err) {
     if (browser) browser.close().catch(() => {});
     res.json({ ok: false, error: err.message });
