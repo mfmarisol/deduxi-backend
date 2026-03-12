@@ -23,18 +23,37 @@ app.use(cors({
 app.use(express.json({ limit: '512kb' }));
 
 /* ── Puppeteer launcher ── */
-const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
+// Find chromium: try env var, then common paths
+const findChrome = () => {
+  const fromEnv = process.env.PUPPETEER_EXECUTABLE_PATH;
+  if (fromEnv) return fromEnv;
+  const candidates = [
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+  ];
+  const fs = require('fs');
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch (_) {}
+  }
+  return '/usr/bin/chromium';
+};
+
 const launchBrowser = () =>
   puppeteer.launch({
-    executablePath: CHROME_PATH,
-    headless: 'new',
+    executablePath: findChrome(),
+    headless: true,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--single-process',
-      '--no-zygote',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--mute-audio',
+      '--no-first-run',
     ],
   });
 
@@ -131,8 +150,8 @@ app.post('/api/arca/start', async (req, res) => {
 
   } catch (err) {
     if (browser) browser.close().catch(() => {});
-    console.error('[start error]', err.message);
-    res.json({ ok: false, error: 'error_conexion', msg: 'No pudimos conectar con ARCA. Intentá de nuevo.' });
+    console.error('[start error]', err.message, err.stack?.split('\n')[1]);
+    res.json({ ok: false, error: 'error_conexion', msg: `Error: ${err.message}` });
   }
 });
 
@@ -261,5 +280,15 @@ app.post('/api/arca/refresh-captcha', async (req, res) => {
 app.get('/health', (_, res) =>
   res.json({ ok: true, sessions: sessions.size, uptime: Math.round(process.uptime()) })
 );
+
+/* ── Debug: check Chrome path ── */
+app.get('/debug', (_, res) => {
+  const fs = require('fs');
+  const chromePath = findChrome();
+  const exists = fs.existsSync(chromePath);
+  const candidates = ['/usr/bin/chromium','/usr/bin/chromium-browser','/usr/bin/google-chrome'];
+  const found = candidates.filter(p => { try { return fs.existsSync(p); } catch(_){ return false; }});
+  res.json({ chromePath, exists, found, env: process.env.PUPPETEER_EXECUTABLE_PATH || null });
+});
 
 app.listen(PORT, () => console.log(`[deduxi-backend] listening on :${PORT}`));
