@@ -158,31 +158,39 @@ app.post('/api/arca/start', async (req, res) => {
       });
     }
 
-    // 3. Clear and type CUIT using element handle
-    const { el: cuitEl } = cuitResult;
-    await cuitEl.click({ clickCount: 3 });
-    await sleep(100);
-    await cuitEl.type(cuitRaw, { delay: 40 });
+    // 3. Fill CUIT and click Siguiente via page.evaluate (avoids Puppeteer type issues with number inputs)
+    const filled = await page.evaluate((cuit) => {
+      // Try multiple ways to find the CUIT input
+      const el = document.getElementById('F1:username') ||
+                 document.querySelector('input[name="F1:username"]') ||
+                 document.querySelector('input[type="number"]') ||
+                 document.querySelector('input[name*="username"]');
+      if (!el) return { ok: false, msg: 'CUIT input not found in DOM' };
 
-    // 4. Click "Siguiente" — ARCA button id is F1:btnSiguiente
-    const siguienteResult = await findElement(page, [
-      '#F1\\:btnSiguiente',
-      'input[value="Siguiente"]',
-      'input[id*="Siguiente"]',
-      'input[type="submit"]',
-      'button[type="submit"]',
-    ], { timeout: 5000 });
+      // Set value
+      el.value = cuit;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
 
-    if (!siguienteResult) {
+      return { ok: true, id: el.id, name: el.name };
+    }, cuitRaw);
+
+    console.log('[start] fill CUIT result:', JSON.stringify(filled));
+    if (!filled.ok) {
       await browser.close();
-      return res.json({ ok: false, error: 'error_conexion', msg: 'No se encontró el botón Siguiente en ARCA.' });
+      return res.json({ ok: false, error: 'error_conexion', msg: 'No se pudo completar el CUIT: ' + filled.msg });
     }
 
-    // Click and wait for navigation
-    await Promise.all([
-      siguienteResult.el.click(),
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
-    ]);
+    // 4. Click "Siguiente" via evaluate
+    await page.evaluate(() => {
+      const btn = document.getElementById('F1:btnSiguiente') ||
+                  document.querySelector('input[type="submit"]') ||
+                  document.querySelector('button[type="submit"]');
+      if (btn) btn.click();
+    });
+
+    // Wait for navigation to the clave page
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
 
     await sleep(2000);
     console.log('[start] after Siguiente, url:', page.url());
@@ -263,49 +271,39 @@ app.post('/api/arca/complete', async (req, res) => {
   const { browser, page } = s;
 
   try {
-    // Find and fill password field
-    const passResult = await findElement(page, [
-      '#F1\\:password',
-      'input[id$=":password"]',
-      'input[id*="password"]',
-      'input[type="password"]',
-    ]);
+    // Fill password and captcha via page.evaluate to avoid Puppeteer type issues
+    const filled = await page.evaluate((clave, captcha) => {
+      const passEl = document.getElementById('F1:password') ||
+                     document.querySelector('input[type="password"]') ||
+                     document.querySelector('input[name*="password"]');
+      if (!passEl) return { ok: false, msg: 'password field not found' };
+      passEl.value = clave;
+      passEl.dispatchEvent(new Event('input', { bubbles: true }));
+      passEl.dispatchEvent(new Event('change', { bubbles: true }));
 
-    if (passResult) {
-      await passResult.el.click({ clickCount: 3 });
-      await passResult.el.type(clave, { delay: 30 });
-    } else {
-      throw new Error('No se encontró el campo de clave fiscal');
-    }
+      const captchaEl = document.getElementById('F1:captchaSolutionInput') ||
+                        document.querySelector('input[name*="captcha"]') ||
+                        document.querySelector('input[id*="captcha"]');
+      if (!captchaEl) return { ok: false, msg: 'captcha field not found' };
+      captchaEl.value = captcha;
+      captchaEl.dispatchEvent(new Event('input', { bubbles: true }));
+      captchaEl.dispatchEvent(new Event('change', { bubbles: true }));
 
-    // Find and fill captcha field
-    const captchaFieldResult = await findElement(page, [
-      '#F1\\:captchaSolutionInput',
-      'input[id*="captcha"]',
-      'input[name*="captcha"]',
-    ]);
+      return { ok: true };
+    }, clave, captchaSolution.trim());
 
-    if (captchaFieldResult) {
-      await captchaFieldResult.el.click({ clickCount: 3 });
-      await captchaFieldResult.el.type(captchaSolution.trim(), { delay: 30 });
-    } else {
-      throw new Error('No se encontró el campo de CAPTCHA');
-    }
+    console.log('[complete] fill result:', JSON.stringify(filled));
+    if (!filled.ok) throw new Error(filled.msg);
 
-    // Click Ingresar
-    const ingresarResult = await findElement(page, [
-      'input[value="Ingresar"]',
-      'button[value="Ingresar"]',
-      'input[type="submit"]',
-      'button[type="submit"]',
-    ], { timeout: 5000 });
+    // Click Ingresar via evaluate
+    await page.evaluate(() => {
+      const btn = document.querySelector('input[value="Ingresar"]') ||
+                  document.querySelector('input[type="submit"]') ||
+                  document.querySelector('button[type="submit"]');
+      if (btn) btn.click();
+    });
 
-    if (!ingresarResult) throw new Error('No se encontró el botón Ingresar');
-
-    await Promise.all([
-      ingresarResult.el.click(),
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
-    ]);
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
 
     await sleep(1000);
 
