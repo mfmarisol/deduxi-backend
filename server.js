@@ -136,13 +136,14 @@ app.post('/api/arca/start', async (req, res) => {
     await sleep(2000);
 
     // 2. Find CUIT input field with multiple fallback selectors
+    // NOTE: ARCA uses type="number" for CUIT, not type="text"
     const cuitResult = await findElement(page, [
       '#F1\\:username',
       'input[id$=":username"]',
       'input[id$="username"]',
       'input[name*="username"]',
+      'input[type="number"]',
       'input[autocomplete="username"]',
-      'input[type="text"]',
     ], { timeout: 10000 });
 
     if (!cuitResult) {
@@ -163,10 +164,11 @@ app.post('/api/arca/start', async (req, res) => {
     await sleep(100);
     await cuitEl.type(cuitRaw, { delay: 40 });
 
-    // 4. Click "Siguiente"
+    // 4. Click "Siguiente" — ARCA button id is F1:btnSiguiente
     const siguienteResult = await findElement(page, [
+      '#F1\\:btnSiguiente',
       'input[value="Siguiente"]',
-      'button[value="Siguiente"]',
+      'input[id*="Siguiente"]',
       'input[type="submit"]',
       'button[type="submit"]',
     ], { timeout: 5000 });
