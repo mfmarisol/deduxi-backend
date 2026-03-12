@@ -354,10 +354,10 @@ app.post('/api/arca/complete', async (req, res) => {
     const loginSucceeded = !url.includes('login.xhtml');
 
     if (loginSucceeded) {
-      console.log(`[complete] login OK, session ${sessionId}`);
-      sessions.delete(sessionId);
-      browser.close().catch(() => {});
-      return res.json({ ok: true });
+      console.log(`[complete] login OK, landing: ${url}`);
+      // Keep session alive for comprobantes fetching
+      sessions.set(sessionId, { browser, page, createdAt: Date.now(), authenticated: true });
+      return res.json({ ok: true, arcaSessionId: sessionId, landingUrl: url });
     }
 
     // Still on login page → parse error
@@ -558,6 +558,78 @@ app.get('/debug/arca-step2', async (req, res) => {
   } catch (err) {
     if (browser) browser.close().catch(() => {});
     res.json({ ok: false, error: err.message });
+  }
+});
+
+/* ─────────────────────────────────────────
+   POST /api/arca/fetch-comprobantes
+   Body: { sessionId, periodo: "2026-03" }
+   → Navigates to "Mis Comprobantes" → Recibidos for the given month
+   ← { ok, comprobantes: [...] }
+───────────────────────────────────────── */
+app.post('/api/arca/fetch-comprobantes', async (req, res) => {
+  const { sessionId, periodo } = req.body; // periodo: "2026-03"
+  const s = sessions.get(sessionId);
+  if (!s || !s.authenticated)
+    return res.json({ ok: false, error: 'sesion_expirada', msg: 'La sesión expiró. Volvé a conectar con ARCA.' });
+
+  const { browser, page } = s;
+
+  // Parse periodo → mes/año
+  const [year, month] = (periodo || new Date().toISOString().slice(0, 7)).split('-');
+
+  try {
+    console.log(`[comprobantes] fetching for ${year}-${month}`);
+
+    // 1. Navigate to "Mis Comprobantes" in ARCA portal
+    // ARCA uses the same auth session across *.afip.gob.ar / *.arca.gob.ar
+    await page.goto('https://comprobantes.afip.gob.ar/cgi-bin/cgi_cile?modoAcceso=RangoFechas&opcion=1', {
+      waitUntil: 'networkidle2',
+      timeout: 30000,
+    });
+    await sleep(2000);
+
+    const urlAfterNav = page.url();
+    console.log(`[comprobantes] after nav to CILE: ${urlAfterNav}`);
+
+    // If redirected to login, session expired
+    if (urlAfterNav.includes('login') || urlAfterNav.includes('auth.afip')) {
+      sessions.delete(sessionId);
+      browser.close().catch(() => {});
+      return res.json({ ok: false, error: 'sesion_expirada', msg: 'La sesión de ARCA expiró. Volvé a conectar.' });
+    }
+
+    // 2. Take debug screenshot + list all links to understand the portal
+    const shot = await page.screenshot({ encoding: 'base64' }).catch(() => null);
+    const title = await page.title().catch(() => '');
+    const links = await page.$$eval('a', els => els.map(a => ({ text: a.textContent.trim().slice(0, 60), href: a.href.slice(0, 100) }))).catch(() => []);
+    const inputs = await page.$$eval('input,select', els => els.map(el => ({ tag: el.tagName, id: el.id, name: el.name, type: el.type || '', visible: el.offsetWidth > 0 }))).catch(() => []);
+
+    console.log(`[comprobantes] title: ${title}`);
+    console.log(`[comprobantes] links: ${JSON.stringify(links.slice(0, 20))}`);
+    console.log(`[comprobantes] inputs: ${JSON.stringify(inputs)}`);
+
+    // 3. Look for "Recibidos" / comprobantes link
+    const recibidosLink = links.find(l =>
+      /recib/i.test(l.text) || /recib/i.test(l.href) || /receptor/i.test(l.text)
+    );
+    console.log('[comprobantes] recibidos link:', JSON.stringify(recibidosLink));
+
+    // Return debug info for now so we can understand the portal structure
+    return res.json({
+      ok: true,
+      debug: true,
+      title,
+      urlAfterNav,
+      links: links.slice(0, 30),
+      inputs,
+      shot,
+      comprobantes: [], // will be filled in next iteration
+    });
+
+  } catch (err) {
+    console.error('[comprobantes error]', err.message);
+    res.json({ ok: false, error: 'error_portal', msg: 'Error al navegar el portal de ARCA: ' + err.message });
   }
 });
 
