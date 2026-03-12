@@ -181,18 +181,18 @@ app.post('/api/arca/start', async (req, res) => {
       return res.json({ ok: false, error: 'error_conexion', msg: 'No se pudo completar el CUIT: ' + filled.msg });
     }
 
-    // 4. Click "Siguiente" via evaluate
-    await page.evaluate(() => {
-      const btn = document.getElementById('F1:btnSiguiente') ||
-                  document.querySelector('input[type="submit"]') ||
-                  document.querySelector('button[type="submit"]');
-      if (btn) btn.click();
-    });
+    // 4. Click "Siguiente" + wait for navigation (Promise.all to avoid race condition)
+    await Promise.all([
+      page.evaluate(() => {
+        const btn = document.getElementById('F1:btnSiguiente') ||
+                    document.querySelector('input[type="submit"]') ||
+                    document.querySelector('button[type="submit"]');
+        if (btn) btn.click();
+      }),
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {}),
+    ]);
 
-    // Wait for navigation to the clave page
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-
-    await sleep(2000);
+    await sleep(1500);
     console.log('[start] after Siguiente, url:', page.url());
 
     // 5. Check for CUIT-level error
@@ -221,31 +221,53 @@ app.post('/api/arca/start', async (req, res) => {
       });
     }
 
-    // 7. Capture CAPTCHA image
-    const captchaEl =
-      (await page.$('img[alt*="aptcha"]')) ||
-      (await page.$('img[alt*="APTCHA"]')) ||
-      (await page.$('img[src*="captcha"]')) ||
-      (await page.$('img[src*="Captcha"]'));
+    // 7. Get CAPTCHA image via fetch in page context (avoids ElementHandle.screenshot issues)
+    const captchaData = await page.evaluate(async () => {
+      // Find the captcha image element
+      const img = document.querySelector('img[alt*="aptcha"]') ||
+                  document.querySelector('img[alt*="APTCHA"]') ||
+                  document.querySelector('img[src*="captcha"]') ||
+                  document.querySelector('img[src*="Captcha"]') ||
+                  document.querySelector('img[src*="arca"]');
+      if (!img) return { ok: false, msg: 'captcha img not found', imgs: Array.from(document.querySelectorAll('img')).map(i => i.src) };
 
-    if (!captchaEl) {
+      // Fetch the image using page's cookies/session
+      try {
+        const resp = await fetch(img.src, { credentials: 'include' });
+        if (!resp.ok) return { ok: false, msg: `fetch failed: ${resp.status}` };
+        const blob = await resp.blob();
+        return await new Promise(resolve => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve({ ok: true, dataUrl: reader.result });
+          reader.onerror = () => resolve({ ok: false, msg: 'FileReader error' });
+          reader.readAsDataURL(blob);
+        });
+      } catch (e) {
+        // Fallback: use img.src directly if it's already a data URL
+        if (img.src.startsWith('data:')) return { ok: true, dataUrl: img.src };
+        return { ok: false, msg: 'fetch error: ' + e.message, src: img.src };
+      }
+    });
+
+    console.log('[start] captcha fetch result ok:', captchaData.ok, 'msg:', captchaData.msg || '');
+    if (!captchaData.ok) {
       await browser.close();
       return res.json({
         ok: false,
         error: 'captcha_no_encontrado',
-        msg: 'No se pudo capturar la imagen del CAPTCHA de ARCA.',
+        msg: 'No se pudo capturar la imagen del CAPTCHA de ARCA. ' + (captchaData.msg || ''),
       });
     }
 
-    const captchaB64 = await captchaEl.screenshot({ encoding: 'base64' });
-    console.log('[start] captcha captured, size:', captchaB64.length);
+    const captchaDataUrl = captchaData.dataUrl;
+    console.log('[start] captcha captured, size:', captchaDataUrl.length);
 
     // 8. Store session
     const sessionId = uuidv4();
     sessions.set(sessionId, { browser, page, createdAt: Date.now() });
 
     console.log(`[start] session ${sessionId} created`);
-    res.json({ ok: true, sessionId, captcha: `data:image/png;base64,${captchaB64}` });
+    res.json({ ok: true, sessionId, captcha: captchaDataUrl });
 
   } catch (err) {
     if (browser) browser.close().catch(() => {});
@@ -295,15 +317,16 @@ app.post('/api/arca/complete', async (req, res) => {
     console.log('[complete] fill result:', JSON.stringify(filled));
     if (!filled.ok) throw new Error(filled.msg);
 
-    // Click Ingresar via evaluate
-    await page.evaluate(() => {
-      const btn = document.querySelector('input[value="Ingresar"]') ||
-                  document.querySelector('input[type="submit"]') ||
-                  document.querySelector('button[type="submit"]');
-      if (btn) btn.click();
-    });
-
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    // Click Ingresar + wait for navigation
+    await Promise.all([
+      page.evaluate(() => {
+        const btn = document.querySelector('input[value="Ingresar"]') ||
+                    document.querySelector('input[type="submit"]') ||
+                    document.querySelector('button[type="submit"]');
+        if (btn) btn.click();
+      }),
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {}),
+    ]);
 
     await sleep(1000);
 
@@ -324,29 +347,37 @@ app.post('/api/arca/complete', async (req, res) => {
     const isCaptchaErr = /captcha|imagen|código|caracter/i.test(errText);
 
     if (isCaptchaErr) {
-      try {
-        const refreshBtn =
-          (await page.$('a[id*="refresh"]')) ||
-          (await page.$('a[onclick*="captcha"]')) ||
-          (await page.$('[id*="refresh"]'));
-        if (refreshBtn) {
-          await refreshBtn.click();
-          await sleep(900);
-        }
-      } catch (_) {}
+      // Try to refresh captcha via DOM
+      await page.evaluate(() => {
+        const refreshBtn = document.querySelector('a[id*="refresh"]') ||
+                           document.querySelector('a[onclick*="captcha"]') ||
+                           document.querySelector('[id*="refresh"]');
+        if (refreshBtn) refreshBtn.click();
+      }).catch(() => {});
+      await sleep(900);
 
-      const captchaEl =
-        (await page.$('img[alt*="aptcha"]')) ||
-        (await page.$('img[src*="captcha"]'));
-      const newCaptcha = captchaEl
-        ? `data:image/png;base64,${await captchaEl.screenshot({ encoding: 'base64' })}`
-        : null;
+      // Get new captcha via fetch
+      const newCaptchaData = await page.evaluate(async () => {
+        const img = document.querySelector('img[alt*="aptcha"]') ||
+                    document.querySelector('img[src*="captcha"]');
+        if (!img) return null;
+        try {
+          const resp = await fetch(img.src, { credentials: 'include' });
+          const blob = await resp.blob();
+          return await new Promise(resolve => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = () => resolve(null);
+            reader.readAsDataURL(blob);
+          });
+        } catch (_) { return img.src.startsWith('data:') ? img.src : null; }
+      }).catch(() => null);
 
       return res.json({
         ok: false,
         error: 'captcha_incorrecto',
         msg: 'El código de la imagen no era correcto. Intentá de nuevo.',
-        captcha: newCaptcha,
+        captcha: newCaptchaData,
       });
     }
 
@@ -378,20 +409,30 @@ app.post('/api/arca/refresh-captcha', async (req, res) => {
 
   const { page } = s;
   try {
-    const refreshBtn =
-      (await page.$('a[id*="refresh"]')) ||
-      (await page.$('a[onclick*="captcha"]'));
-    if (refreshBtn) {
-      await refreshBtn.click();
-      await sleep(900);
-    }
-    const captchaEl =
-      (await page.$('img[alt*="aptcha"]')) ||
-      (await page.$('img[src*="captcha"]'));
-    const b64 = captchaEl
-      ? await captchaEl.screenshot({ encoding: 'base64' })
-      : null;
-    res.json({ ok: !!b64, captcha: b64 ? `data:image/png;base64,${b64}` : null });
+    await page.evaluate(() => {
+      const btn = document.querySelector('a[id*="refresh"]') ||
+                  document.querySelector('a[onclick*="captcha"]');
+      if (btn) btn.click();
+    }).catch(() => {});
+    await sleep(900);
+
+    const dataUrl = await page.evaluate(async () => {
+      const img = document.querySelector('img[alt*="aptcha"]') ||
+                  document.querySelector('img[src*="captcha"]');
+      if (!img) return null;
+      try {
+        const resp = await fetch(img.src, { credentials: 'include' });
+        const blob = await resp.blob();
+        return await new Promise(resolve => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result);
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(blob);
+        });
+      } catch (_) { return img.src.startsWith('data:') ? img.src : null; }
+    }).catch(() => null);
+
+    res.json({ ok: !!dataUrl, captcha: dataUrl });
   } catch (err) {
     res.json({ ok: false, error: 'refresh_error' });
   }
