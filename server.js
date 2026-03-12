@@ -214,17 +214,24 @@ app.post('/api/arca/start', async (req, res) => {
     }))).catch(() => []);
     console.log('[start] inputs on page:', JSON.stringify(pageInputs));
 
-    // 7. Get CAPTCHA image via fetch in page context (avoids ElementHandle.screenshot issues)
+    // 7. Get CAPTCHA image — ARCA embeds it as a data URL directly in the page
     const captchaData = await page.evaluate(async () => {
-      // Find the captcha image element
+      // Find the captcha image element (alt='Captcha' on ARCA)
       const img = document.querySelector('img[alt*="aptcha"]') ||
                   document.querySelector('img[alt*="APTCHA"]') ||
+                  document.querySelector('img[alt="Captcha"]') ||
                   document.querySelector('img[src*="captcha"]') ||
-                  document.querySelector('img[src*="Captcha"]') ||
-                  document.querySelector('img[src*="arca"]');
-      if (!img) return { ok: false, msg: 'captcha img not found', imgs: Array.from(document.querySelectorAll('img')).map(i => i.src) };
+                  document.querySelector('img[src*="Captcha"]');
+      if (!img) return {
+        ok: false,
+        msg: 'captcha img not found',
+        imgs: Array.from(document.querySelectorAll('img')).map(i => ({ src: i.src.slice(0, 100), alt: i.alt }))
+      };
 
-      // Fetch the image using page's cookies/session
+      // If already a data URL (ARCA embeds it directly), return it immediately
+      if (img.src.startsWith('data:')) return { ok: true, dataUrl: img.src };
+
+      // Otherwise fetch with session cookies
       try {
         const resp = await fetch(img.src, { credentials: 'include' });
         if (!resp.ok) return { ok: false, msg: `fetch failed: ${resp.status}` };
@@ -236,9 +243,7 @@ app.post('/api/arca/start', async (req, res) => {
           reader.readAsDataURL(blob);
         });
       } catch (e) {
-        // Fallback: use img.src directly if it's already a data URL
-        if (img.src.startsWith('data:')) return { ok: true, dataUrl: img.src };
-        return { ok: false, msg: 'fetch error: ' + e.message, src: img.src };
+        return { ok: false, msg: 'fetch error: ' + e.message };
       }
     });
 
@@ -310,10 +315,11 @@ app.post('/api/arca/complete', async (req, res) => {
     console.log('[complete] fill result:', JSON.stringify(filled));
     if (!filled.ok) throw new Error(filled.msg);
 
-    // Click Ingresar + wait for navigation
+    // Click Ingresar + wait for navigation — ARCA button id is F1:btnIngresar
     await Promise.all([
       page.evaluate(() => {
-        const btn = document.querySelector('input[value="Ingresar"]') ||
+        const btn = document.getElementById('F1:btnIngresar') ||
+                    document.querySelector('input[value="Ingresar"]') ||
                     document.querySelector('input[type="submit"]') ||
                     document.querySelector('button[type="submit"]');
         if (btn) btn.click();
