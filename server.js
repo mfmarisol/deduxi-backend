@@ -15,15 +15,14 @@ const ORIGINS = (process.env.ALLOWED_ORIGINS || '')
 
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // server-to-server / curl
+    if (!origin) return cb(null, true);
     const ok = ORIGINS.some(o => origin === o || origin.endsWith('.vercel.app'));
     cb(ok ? null : new Error('CORS'), ok);
   },
 }));
-app.use(express.json({ limit: '512kb' }));
+app.use(express.json({ limit: '1mb' }));
 
 /* ── Puppeteer launcher ── */
-// Find chromium: try env var, then common paths
 const findChrome = () => {
   const fromEnv = process.env.PUPPETEER_EXECUTABLE_PATH;
   if (fromEnv) return fromEnv;
@@ -54,11 +53,37 @@ const launchBrowser = () =>
       '--disable-default-apps',
       '--mute-audio',
       '--no-first-run',
+      '--window-size=1280,900',
     ],
   });
 
+/* ── Helpers ── */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Try multiple selectors and return the first visible match
+async function findElement(page, selectors, opts = {}) {
+  for (const sel of selectors) {
+    try {
+      const el = await page.waitForSelector(sel, { timeout: 3000, visible: true, ...opts });
+      if (el) {
+        console.log(`[findElement] found: ${sel}`);
+        return { el, sel };
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
+// Take a debug screenshot as base64
+async function debugShot(page) {
+  try {
+    return await page.screenshot({ encoding: 'base64', fullPage: false });
+  } catch (_) {
+    return null;
+  }
+}
+
 /* ── Session store (in-memory) ── */
-// Map<sessionId, { browser, page, createdAt }>
 const sessions = new Map();
 
 // GC: close sessions older than 8 minutes
@@ -75,9 +100,8 @@ setInterval(() => {
 
 /* ─────────────────────────────────────────
    POST /api/arca/start
-   Body: { cuit: "20-12345678-9" }
-   → Navigates to ARCA login, enters CUIT,
-     gets to clave+captcha page.
+   Body: { cuit: "20123456789" }
+   → Navigates to ARCA login, enters CUIT, gets to clave+captcha page.
    ← { ok, sessionId, captcha: dataURL } or error
 ───────────────────────────────────────── */
 app.post('/api/arca/start', async (req, res) => {
@@ -90,7 +114,7 @@ app.post('/api/arca/start', async (req, res) => {
 
   let browser;
   try {
-    console.log(`[start] CUIT ${cuitRaw.slice(0,2)}***`);
+    console.log(`[start] CUIT ${cuitRaw.slice(0, 2)}***`);
     browser = await launchBrowser();
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 900 });
@@ -99,35 +123,95 @@ app.post('/api/arca/start', async (req, res) => {
     );
 
     // 1. Go to ARCA login
+    console.log('[start] navigating to ARCA...');
     await page.goto('https://auth.afip.gob.ar/contribuyente_/login.xhtml', {
-      waitUntil: 'networkidle2',
-      timeout: 25000,
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
     });
 
-    // 2. Enter CUIT
-    await page.waitForSelector('#F1\\:username', { timeout: 10000 });
-    await page.type('#F1\\:username', cuitRaw, { delay: 40 });
-    await page.click('input[value="Siguiente"]');
+    const url1 = page.url();
+    console.log('[start] landed on:', url1);
 
-    // 3. Wait for navigation to clave page
-    try {
-      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 12000 });
-    } catch (_) {
-      // might not navigate if CUIT is invalid — fall through to error check
+    // Wait for JS to render
+    await sleep(2000);
+
+    // 2. Find CUIT input field with multiple fallback selectors
+    const cuitResult = await findElement(page, [
+      '#F1\\:username',
+      'input[id$=":username"]',
+      'input[id$="username"]',
+      'input[name*="username"]',
+      'input[autocomplete="username"]',
+      'input[type="text"]',
+    ], { timeout: 10000 });
+
+    if (!cuitResult) {
+      const shot = await debugShot(page);
+      const html = (await page.content().catch(() => '')).slice(0, 2000);
+      console.error('[start] CUIT input not found. URL:', page.url(), 'HTML:', html);
+      await browser.close();
+      return res.json({
+        ok: false,
+        error: 'error_conexion',
+        msg: 'No se encontró el campo de CUIT en ARCA. El sitio puede estar en mantenimiento.',
+      });
     }
 
-    // 4. Check for CUIT-level error
+    // 3. Clear and type CUIT using element handle
+    const { el: cuitEl } = cuitResult;
+    await cuitEl.click({ clickCount: 3 });
+    await sleep(100);
+    await cuitEl.type(cuitRaw, { delay: 40 });
+
+    // 4. Click "Siguiente"
+    const siguienteResult = await findElement(page, [
+      'input[value="Siguiente"]',
+      'button[value="Siguiente"]',
+      'input[type="submit"]',
+      'button[type="submit"]',
+    ], { timeout: 5000 });
+
+    if (!siguienteResult) {
+      await browser.close();
+      return res.json({ ok: false, error: 'error_conexion', msg: 'No se encontró el botón Siguiente en ARCA.' });
+    }
+
+    // Click and wait for navigation
+    await Promise.all([
+      siguienteResult.el.click(),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
+    ]);
+
+    await sleep(2000);
+    console.log('[start] after Siguiente, url:', page.url());
+
+    // 5. Check for CUIT-level error
     const errText = await page.$eval('#F1\\:msg', el => el.textContent.trim()).catch(() => '');
     if (errText && errText.length > 2) {
       await browser.close();
       return res.json({ ok: false, error: 'cuit_no_encontrado', msg: errText });
     }
 
-    // 5. Wait for the captcha solution input to confirm we're on the right page
-    await page.waitForSelector('#F1\\:captchaSolutionInput', { timeout: 12000 });
+    // 6. Wait for captcha solution input (confirms we're on the password page)
+    const captchaInputResult = await findElement(page, [
+      '#F1\\:captchaSolutionInput',
+      'input[id*="captcha"]',
+      'input[name*="captcha"]',
+      'input[placeholder*="aptcha"]',
+    ], { timeout: 15000 });
 
-    // 6. Screenshot the CAPTCHA image
-    // Try multiple selectors in order of specificity
+    if (!captchaInputResult) {
+      const shot = await debugShot(page);
+      console.error('[start] captcha input not found. URL:', page.url());
+      await browser.close();
+      return res.json({
+        ok: false,
+        error: 'error_conexion',
+        msg: 'No apareció la pantalla de clave fiscal. Verificá que el CUIT esté registrado en ARCA.',
+      });
+    }
+
+    // 7. Capture CAPTCHA image
     const captchaEl =
       (await page.$('img[alt*="aptcha"]')) ||
       (await page.$('img[alt*="APTCHA"]')) ||
@@ -136,12 +220,17 @@ app.post('/api/arca/start', async (req, res) => {
 
     if (!captchaEl) {
       await browser.close();
-      return res.json({ ok: false, error: 'captcha_no_encontrado', msg: 'No pudimos cargar el CAPTCHA de ARCA.' });
+      return res.json({
+        ok: false,
+        error: 'captcha_no_encontrado',
+        msg: 'No se pudo capturar la imagen del CAPTCHA de ARCA.',
+      });
     }
 
     const captchaB64 = await captchaEl.screenshot({ encoding: 'base64' });
+    console.log('[start] captcha captured, size:', captchaB64.length);
 
-    // 7. Store session
+    // 8. Store session
     const sessionId = uuidv4();
     sessions.set(sessionId, { browser, page, createdAt: Date.now() });
 
@@ -150,15 +239,14 @@ app.post('/api/arca/start', async (req, res) => {
 
   } catch (err) {
     if (browser) browser.close().catch(() => {});
-    console.error('[start error]', err.message, err.stack?.split('\n')[1]);
-    res.json({ ok: false, error: 'error_conexion', msg: `Error: ${err.message}` });
+    console.error('[start error]', err.message, err.stack?.split('\n').slice(0, 3).join(' | '));
+    res.json({ ok: false, error: 'error_conexion', msg: `Error al conectar con ARCA: ${err.message}` });
   }
 });
 
 /* ─────────────────────────────────────────
    POST /api/arca/complete
    Body: { sessionId, clave, captchaSolution }
-   → Types clave + captcha, submits login.
    ← { ok } on success, or error details
 ───────────────────────────────────────── */
 app.post('/api/arca/complete', async (req, res) => {
@@ -173,21 +261,54 @@ app.post('/api/arca/complete', async (req, res) => {
   const { browser, page } = s;
 
   try {
-    // Type clave fiscal (never logged)
-    await page.click('#F1\\:password', { clickCount: 3 });
-    await page.type('#F1\\:password', clave, { delay: 30 });
-
-    // Type CAPTCHA solution
-    await page.click('#F1\\:captchaSolutionInput', { clickCount: 3 });
-    await page.type('#F1\\:captchaSolutionInput', captchaSolution.trim(), { delay: 30 });
-
-    // Click Ingresar
-    await Promise.all([
-      page.click('input[value="Ingresar"]'),
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 18000 }).catch(() => {}),
+    // Find and fill password field
+    const passResult = await findElement(page, [
+      '#F1\\:password',
+      'input[id$=":password"]',
+      'input[id*="password"]',
+      'input[type="password"]',
     ]);
 
+    if (passResult) {
+      await passResult.el.click({ clickCount: 3 });
+      await passResult.el.type(clave, { delay: 30 });
+    } else {
+      throw new Error('No se encontró el campo de clave fiscal');
+    }
+
+    // Find and fill captcha field
+    const captchaFieldResult = await findElement(page, [
+      '#F1\\:captchaSolutionInput',
+      'input[id*="captcha"]',
+      'input[name*="captcha"]',
+    ]);
+
+    if (captchaFieldResult) {
+      await captchaFieldResult.el.click({ clickCount: 3 });
+      await captchaFieldResult.el.type(captchaSolution.trim(), { delay: 30 });
+    } else {
+      throw new Error('No se encontró el campo de CAPTCHA');
+    }
+
+    // Click Ingresar
+    const ingresarResult = await findElement(page, [
+      'input[value="Ingresar"]',
+      'button[value="Ingresar"]',
+      'input[type="submit"]',
+      'button[type="submit"]',
+    ], { timeout: 5000 });
+
+    if (!ingresarResult) throw new Error('No se encontró el botón Ingresar');
+
+    await Promise.all([
+      ingresarResult.el.click(),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
+    ]);
+
+    await sleep(1000);
+
     const url = page.url();
+    console.log('[complete] after submit, url:', url);
     const loginSucceeded = !url.includes('login.xhtml');
 
     if (loginSucceeded) {
@@ -199,10 +320,10 @@ app.post('/api/arca/complete', async (req, res) => {
 
     // Still on login page → parse error
     const errText = await page.$eval('#F1\\:msg', el => el.textContent.trim()).catch(() => '');
-    const isCaptchaErr = /captcha|imagen|código/i.test(errText);
+    console.log('[complete] login failed, errText:', errText);
+    const isCaptchaErr = /captcha|imagen|código|caracter/i.test(errText);
 
     if (isCaptchaErr) {
-      // Refresh captcha image, keep session alive for retry
       try {
         const refreshBtn =
           (await page.$('a[id*="refresh"]')) ||
@@ -210,7 +331,7 @@ app.post('/api/arca/complete', async (req, res) => {
           (await page.$('[id*="refresh"]'));
         if (refreshBtn) {
           await refreshBtn.click();
-          await new Promise(r => setTimeout(r, 900));
+          await sleep(900);
         }
       } catch (_) {}
 
@@ -229,20 +350,20 @@ app.post('/api/arca/complete', async (req, res) => {
       });
     }
 
-    // Wrong clave or CUIT mismatch
+    // Wrong clave
     sessions.delete(sessionId);
     browser.close().catch(() => {});
     return res.json({
       ok: false,
       error: 'clave_incorrecta',
-      msg: errText || 'Clave fiscal incorrecta.',
+      msg: errText || 'Clave fiscal incorrecta. Verificá tu contraseña de ARCA.',
     });
 
   } catch (err) {
     sessions.delete(sessionId);
     browser.close().catch(() => {});
     console.error('[complete error]', err.message);
-    res.json({ ok: false, error: 'error_conexion', msg: 'Error al comunicarse con ARCA.' });
+    res.json({ ok: false, error: 'error_conexion', msg: 'Error al comunicarse con ARCA: ' + err.message });
   }
 });
 
@@ -262,7 +383,7 @@ app.post('/api/arca/refresh-captcha', async (req, res) => {
       (await page.$('a[onclick*="captcha"]'));
     if (refreshBtn) {
       await refreshBtn.click();
-      await new Promise(r => setTimeout(r, 900));
+      await sleep(900);
     }
     const captchaEl =
       (await page.$('img[alt*="aptcha"]')) ||
@@ -286,9 +407,54 @@ app.get('/debug', (_, res) => {
   const fs = require('fs');
   const chromePath = findChrome();
   const exists = fs.existsSync(chromePath);
-  const candidates = ['/usr/bin/chromium','/usr/bin/chromium-browser','/usr/bin/google-chrome'];
-  const found = candidates.filter(p => { try { return fs.existsSync(p); } catch(_){ return false; }});
+  const candidates = ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'];
+  const found = candidates.filter(p => { try { return fs.existsSync(p); } catch (_) { return false; } });
   res.json({ chromePath, exists, found, env: process.env.PUPPETEER_EXECUTABLE_PATH || null });
+});
+
+/* ── Debug: test puppeteer can navigate ── */
+app.get('/debug/launch', async (_, res) => {
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const page = await browser.newPage();
+    await page.goto('https://example.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    const title = await page.title();
+    await browser.close();
+    res.json({ ok: true, title });
+  } catch (err) {
+    if (browser) browser.close().catch(() => {});
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+/* ── Debug: screenshot ARCA login + list all inputs ── */
+app.get('/debug/arca', async (_, res) => {
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 900 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36');
+    await page.goto('https://auth.afip.gob.ar/contribuyente_/login.xhtml', {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
+    });
+    await sleep(2500);
+    const shot = await page.screenshot({ encoding: 'base64' });
+    const inputs = await page.$$eval('input', els => els.map(el => ({
+      id: el.id, name: el.name, type: el.type,
+      value: el.value.slice(0, 20),
+      visible: el.offsetWidth > 0 && el.offsetHeight > 0,
+    })));
+    const title = await page.title();
+    const url = page.url();
+    await browser.close();
+    res.json({ ok: true, title, url, inputs, shot });
+  } catch (err) {
+    if (browser) browser.close().catch(() => {});
+    res.json({ ok: false, error: err.message });
+  }
 });
 
 app.listen(PORT, () => console.log(`[deduxi-backend] listening on :${PORT}`));
