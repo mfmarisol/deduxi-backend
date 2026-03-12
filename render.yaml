@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: deduxi-backend
+    runtime: docker
+    plan: free
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://deduxi-deploy.vercel.app
+      - key: PORT
+        value: 3001
+    healthCheckPath: /health
