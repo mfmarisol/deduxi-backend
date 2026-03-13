@@ -416,9 +416,10 @@ app.post('/api/arca/complete', async (req, res) => {
           }
 
           // Step D2: Set date filter to full current month before loading data
-          const lastDay = new Date(parseInt(yr), parseInt(mo), 0).getDate();
+          // Use today as end date — ARCA only has data up to yesterday
+          const today = new Date();
           const dateFrom = `01/${mo}/${yr}`;
-          const dateTo = `${String(lastDay).padStart(2,'0')}/${mo}/${yr}`;
+          const dateTo = `${String(today.getDate()).padStart(2,'0')}/${String(today.getMonth()+1).padStart(2,'0')}/${today.getFullYear()}`;
           const dateRange = `${dateFrom} - ${dateTo}`;
           compDebug.push(`D2: setting date range: ${dateRange}`);
 
