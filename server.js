@@ -439,9 +439,31 @@ app.post('/api/arca/complete', async (req, res) => {
             compDebug.push(`D done: ${page.url()}`);
           }
 
-          // Step D2: REMOVED — changing the daterangepicker breaks the table reload.
-          // The default date range already shows comprobantes. We'll parse whatever is shown.
-          compDebug.push('D2: skipped (using default date range)');
+          // Step D2: Capture page state and click Buscar if needed
+          const pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || '').catch(() => '');
+          compDebug.push(`D2 page text: ${pageText.slice(0, 200)}`);
+
+          // Click Buscar/Consultar button if present (page may need explicit search to load results)
+          const buscarResult = await page.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a.btn, .btn'));
+            const searchBtn = btns.find(b => {
+              const txt = (b.textContent || b.value || '').toLowerCase();
+              return /buscar|consultar|filtrar|search/.test(txt);
+            });
+            if (searchBtn) { searchBtn.click(); return searchBtn.textContent?.trim() || searchBtn.value || 'clicked'; }
+            // Also try submitting any visible form
+            const form = document.querySelector('form[action*="comprobantes"]');
+            if (form) { form.submit(); return 'form-submit'; }
+            return null;
+          }).catch(() => null);
+          compDebug.push(`D2 buscar: ${buscarResult}`);
+
+          if (buscarResult) {
+            // Wait for page reload/AJAX after clicking Buscar
+            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+            await sleep(3000);
+            compDebug.push(`D2 after buscar: ${page.url()}`);
+          }
 
           // Step E: Parse HTML table + handle pagination (click Next)
           compDebug.push('E: parsing table with pagination...');
