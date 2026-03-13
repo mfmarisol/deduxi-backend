@@ -385,15 +385,17 @@ app.post('/api/arca/complete', async (req, res) => {
           // Step B: POST sign+token to service URL
           compDebug.push('B: POSTing token+sign...');
           const svcUrl = api.url || 'https://fes.afip.gob.ar/mcmp/jsp/index.do';
-          await page.evaluate((u, t, s) => {
-            const f = document.createElement('form');
-            f.method='POST'; f.action=u; f.style.display='none';
-            [{n:'token',v:t},{n:'sign',v:s}].forEach(({n,v}) => {
-              const i=document.createElement('input'); i.type='hidden'; i.name=n; i.value=v; f.appendChild(i);
-            });
-            document.body.appendChild(f); f.submit();
-          }, svcUrl, api.token, api.sign).catch(() => {});
-          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
+          await Promise.all([
+            page.evaluate((u, t, s) => {
+              const f = document.createElement('form');
+              f.method='POST'; f.action=u; f.style.display='none';
+              [{n:'token',v:t},{n:'sign',v:s}].forEach(({n,v}) => {
+                const i=document.createElement('input'); i.type='hidden'; i.name=n; i.value=v; f.appendChild(i);
+              });
+              document.body.appendChild(f); f.submit();
+            }, svcUrl, api.token, api.sign),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {}),
+          ]).catch(() => {});
           await sleep(2000);
           compDebug.push(`B done: ${page.url()}`);
 
