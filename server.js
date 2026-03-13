@@ -592,64 +592,88 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
     console.log(`[comprobantes] portal loaded: ${portalTitle}`);
 
     // ── STEP 2: Click "Mis Comprobantes" in the portal (JS-driven link) ──
-    // Listen for new tabs BEFORE clicking
+    // ── STEP 2: Intercept window.open + click "Mis Comprobantes" ──
+    await page.evaluate(() => {
+      window.__capturedUrls = [];
+      const origOpen = window.open;
+      window.open = function(url) {
+        window.__capturedUrls.push(url);
+        return null;
+      };
+    });
+
+    // Also listen for new tabs
     const newPagePromise = new Promise(resolve => {
-      browser.once('targetcreated', async (target) => {
-        const newPage = await target.page();
-        resolve(newPage);
-      });
-      // Timeout after 15s — might not open a new tab
-      setTimeout(() => resolve(null), 15000);
+      const handler = async (target) => { resolve(await target.page().catch(() => null)); };
+      browser.once('targetcreated', handler);
+      setTimeout(() => { browser.removeListener('targetcreated', handler); resolve(null); }, 12000);
     });
 
     const clickResult = await page.evaluate(() => {
-      // Find "Mis Comprobantes" link/button in the portal
-      const allEls = Array.from(document.querySelectorAll('a, button, span, div, li, p'));
+      const allEls = Array.from(document.querySelectorAll('*'));
       const misComp = allEls.find(el => {
+        const text = el.textContent?.trim();
+        return text && /^mis\s*comprobantes$/i.test(text) && el.children.length === 0;
+      }) || allEls.find(el => {
         const text = el.textContent?.trim();
         return text && /^mis\s*comprobantes$/i.test(text);
       });
       if (misComp) {
-        // Try to find the clickable parent or the element itself
-        const clickable = misComp.closest('a') || misComp.closest('button') || misComp.closest('[role="button"]') || misComp.closest('[ng-click]') || misComp.closest('[click]') || misComp;
+        // Get all attrs for debug
+        const clickable = misComp.closest('[ng-click]') || misComp.closest('[onclick]') ||
+                          misComp.closest('a[href]') || misComp.closest('button') ||
+                          misComp.closest('.card') || misComp.closest('[role="button"]') ||
+                          misComp.parentElement?.parentElement?.parentElement || misComp;
+        const attrs = {};
+        for (const a of (clickable.attributes || [])) attrs[a.name] = a.value.slice(0, 120);
         clickable.click();
-        return `clicked: "${misComp.textContent.trim()}" tag=${clickable.tagName} class=${clickable.className?.slice?.(0,80)||''}`;
+        return { found: true, text: misComp.textContent.trim(), tag: clickable.tagName, attrs };
       }
-      // Fallback: try any element containing "comprobantes"
-      const fallback = allEls.find(el => {
-        const text = el.textContent?.trim();
-        return text && /comprobantes/i.test(text) && text.length < 30 && el.tagName !== 'BODY' && el.tagName !== 'HTML';
-      });
-      if (fallback) {
-        const clickable = fallback.closest('a') || fallback.closest('button') || fallback;
-        clickable.click();
-        return `fallback clicked: "${fallback.textContent.trim()}" tag=${clickable.tagName}`;
-      }
-      // List all visible service names for debug
-      const services = allEls.filter(el => {
-        const t = el.textContent?.trim();
-        return t && t.length > 3 && t.length < 60 && el.offsetWidth > 0;
-      }).map(el => el.textContent.trim()).filter((v, i, a) => a.indexOf(v) === i).slice(0, 30);
-      return `NOT FOUND. visible services: ${JSON.stringify(services)}`;
-    }).catch(err => `error: ${err.message}`);
+      return { found: false };
+    }).catch(err => ({ error: err.message }));
 
-    debugLog.push(`click result: ${clickResult}`);
-    console.log(`[comprobantes] click: ${clickResult}`);
+    debugLog.push(`click: ${JSON.stringify(clickResult)}`);
+    console.log(`[comprobantes] click:`, JSON.stringify(clickResult));
 
-    // ── STEP 3: Wait for new tab or navigation ──
-    let compPage = page; // default: same page
+    await sleep(4000);
+
+    // Check intercepted URLs
+    const capturedUrls = await page.evaluate(() => window.__capturedUrls || []).catch(() => []);
+    debugLog.push(`intercepted URLs: ${JSON.stringify(capturedUrls)}`);
+    console.log(`[comprobantes] intercepted:`, capturedUrls);
+
     const newPage = await newPagePromise;
 
-    if (newPage) {
-      debugLog.push('new tab opened!');
-      console.log('[comprobantes] new tab opened');
+    // ── STEP 3: Navigate to the service ──
+    let compPage = page;
+
+    if (capturedUrls.length > 0) {
+      const svcUrl = capturedUrls[0];
+      debugLog.push(`opening intercepted: ${svcUrl}`);
+      await page.goto(svcUrl, { waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
+      await sleep(3000);
+    } else if (newPage) {
+      debugLog.push('new tab opened');
       await newPage.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
       await sleep(3000);
       compPage = newPage;
     } else {
-      debugLog.push('no new tab, checking current page');
-      await sleep(5000);
-      await page.waitForNetworkIdle({ timeout: 8000 }).catch(() => {});
+      // Try extracting URL from DOM attrs or Angular scope
+      const extracted = await page.evaluate(() => {
+        const el = document.querySelector('[ng-click*="comprobante" i], [ng-click*="rcel" i], [data-url*="comprobante" i]');
+        if (el) return { ngClick: el.getAttribute('ng-click'), dataUrl: el.getAttribute('data-url') };
+        // Try to find the Angular scope data
+        const cards = document.querySelectorAll('.card, [ng-repeat], [ng-click]');
+        const info = [];
+        cards.forEach(c => {
+          const ng = c.getAttribute('ng-click') || '';
+          const text = c.textContent?.trim().slice(0, 50) || '';
+          if (ng || /comprobante/i.test(text)) info.push({ ng, text });
+        });
+        return { cards: info.slice(0, 10) };
+      }).catch(() => ({}));
+      debugLog.push(`DOM extract: ${JSON.stringify(extracted)}`);
+      console.log(`[comprobantes] DOM:`, extracted);
     }
 
     let lastUrl = compPage.url();
