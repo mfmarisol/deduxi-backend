@@ -458,10 +458,33 @@ app.post('/api/arca/complete', async (req, res) => {
             await sleep(5000); // wait for table to reload with new date range
           }
 
+          // Step D3: Set DataTables to show ALL entries (avoid pagination)
+          await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
+          await sleep(2000);
+          const showAllResult = await page.evaluate(() => {
+            // DataTables "Show X entries" is typically a <select> with options like 10, 25, 50, 100, -1(All)
+            const selects = document.querySelectorAll('select[name*="length"], .dataTables_length select, select');
+            for (const sel of selects) {
+              const opts = Array.from(sel.options);
+              // Try to find "All" or highest value option
+              const allOpt = opts.find(o => /all|todos|-1/i.test(o.text) || o.value === '-1');
+              const maxOpt = opts.reduce((max, o) => (parseInt(o.value) > parseInt(max.value) ? o : max), opts[0]);
+              const chosen = allOpt || maxOpt;
+              if (chosen && opts.length > 1) {
+                sel.value = chosen.value;
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                return { found: true, value: chosen.value, text: chosen.text, optCount: opts.length };
+              }
+            }
+            return { found: false, selectCount: selects.length };
+          }).catch(() => ({ found: false }));
+          compDebug.push(`D3 show all: ${JSON.stringify(showAllResult)}`);
+          if (showAllResult.found) await sleep(3000); // wait for table to re-render
+
           // Step E: Download CSV/Excel from DataTables export buttons
           compDebug.push('E: looking for export buttons and page content...');
-          await page.waitForSelector('table, .dt-buttons, .buttons-csv, .buttons-excel', { timeout: 10000 }).catch(() => {});
-          await sleep(3000);
+          await page.waitForSelector('table', { timeout: 5000 }).catch(() => {});
+          await sleep(2000);
 
           // First, capture page state for debugging
           const pageInfo = await page.evaluate(() => {
