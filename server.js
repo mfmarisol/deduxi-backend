@@ -448,6 +448,18 @@ app.post('/api/arca/complete', async (req, res) => {
           await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
           await sleep(3000);
 
+          // Debug: list all tables on the page
+          const tableSummary = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('table')).map((t, i) => {
+              const hdr = t.querySelector('thead tr') || t.querySelector('tr:first-child');
+              const headers = hdr ? Array.from(hdr.querySelectorAll('th, td')).map(c => c.textContent.trim()).slice(0, 6) : [];
+              const rows = t.querySelectorAll('tbody tr').length;
+              const vis = t.offsetWidth > 0;
+              return `T${i}:${headers.length}cols,${rows}rows,vis=${vis},[${headers.join('|')}]`;
+            });
+          }).catch(() => []);
+          compDebug.push(`E tables: ${tableSummary.join(' / ')}`);
+
           // Parse current page — find the VISIBLE DataTables table (5 cols), not the hidden detail table (50+ cols)
           const parseCurrentPage = async () => {
             return page.evaluate(() => {
@@ -457,9 +469,13 @@ app.post('/api/arca/complete', async (req, res) => {
                 const headerRow = table.querySelector('thead tr') || table.querySelector('tr:first-child');
                 if (!headerRow) continue;
                 const headers = Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase());
-                // Skip tables with <3 cols, no "fecha", or too many cols (hidden detail/export table)
-                if (headers.length < 3 || headers.length > 15) continue;
-                if (!headers.some(h => /fecha/i.test(h))) continue;
+                // Skip tables with <4 cols, or too many cols (hidden detail/export table >15)
+                if (headers.length < 4 || headers.length > 15) continue;
+                // Must have BOTH a date column AND an amount/emisor column (to avoid filter/history tables)
+                const hasDate = headers.some(h => h === 'fecha');
+                const hasAmount = headers.some(h => /imp\.|total|importe/i.test(h));
+                const hasEmisor = headers.some(h => /emisor|denominaci/i.test(h));
+                if (!hasDate || (!hasAmount && !hasEmisor)) continue;
                 const rows = [];
                 for (const row of table.querySelectorAll('tbody tr')) {
                   const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
