@@ -356,7 +356,13 @@ app.post('/api/arca/complete', async (req, res) => {
     if (loginSucceeded) {
       console.log(`[complete] login OK, landing: ${url}`);
       // Keep session alive for comprobantes fetching
-      sessions.set(sessionId, { browser, page, createdAt: Date.now(), authenticated: true });
+      // Store CUIT in session for fetch-comprobantes fallback
+      const sessionCuit = await page.evaluate(() => {
+        // Try to extract CUIT from the portal URL or page content
+        const m = document.body?.innerText?.match(/\b(20|23|24|27|30|33|34)\d{9}\b/);
+        return m ? m[0] : null;
+      }).catch(() => null);
+      sessions.set(sessionId, { browser, page, createdAt: Date.now(), authenticated: true, cuit: sessionCuit });
       return res.json({ ok: true, arcaSessionId: sessionId, landingUrl: url });
     }
 
@@ -563,114 +569,114 @@ app.get('/debug/arca-step2', async (req, res) => {
 
 /* ─────────────────────────────────────────
    POST /api/arca/fetch-comprobantes
-   Body: { sessionId, periodo: "2026-03" }
-   Strategy (based on live Chrome observation 2026-03-13):
-     1. Go to ARCA portal (portalcf.cloud.afip.gob.ar)
-     2. Click "Mis Comprobantes" with REAL mouse (jQuery handler, <a class="full-width">)
-     3. DO NOT block window.open — let it create the popup naturally
-     4. Capture popup via page.on('popup'), scrape the DataTables table
-     5. Close popup page when done to free memory
-   Key: The portal's jQuery click handler makes an API call that creates a session
-   on fes.afip.gob.ar. Without this step, direct URL returns "Su sesión ha expirado".
+   Body: { sessionId, periodo: "2026-03", cuit: "20404927737" }
+   Strategy v3 — Portal API approach (discovered 2026-03-13 via Chrome network inspection):
+     1. Navigate to ARCA portal (reuses authenticated cookies)
+     2. Call portal REST API: GET /portal/api/servicios/{CUIT}/servicio/mcmp  → service info
+     3. Call portal REST API: GET /portal/api/servicios/{CUIT}/servicio/mcmp/autorizacion → creates SSO session
+     4. Navigate to fes.afip.gob.ar/mcmp/jsp/index.do (session now valid)
+     5. Parse the DataTables table (Fecha | Tipo | Número | Denominación Emisor | Imp. Total)
+   Key insight: The autorizacion call creates the session on fes.afip.gob.ar.
+   Without it, direct navigation returns "Su sesión ha expirado".
 ───────────────────────────────────────── */
 app.post('/api/arca/fetch-comprobantes', async (req, res) => {
-  const { sessionId, periodo } = req.body;
+  const { sessionId, periodo, cuit } = req.body;
   const s = sessions.get(sessionId);
   if (!s || !s.authenticated)
     return res.json({ ok: false, error: 'sesion_expirada', msg: 'La sesión expiró. Volvé a conectar con ARCA.' });
 
   const { browser, page } = s;
   const [year, month] = (periodo || new Date().toISOString().slice(0, 7)).split('-');
+  const userCuit = (cuit || s.cuit || '').replace(/\D/g, '');
   const debugLog = [];
-  let compPage = null; // will hold the popup page — MUST be closed at the end
 
   try {
-    console.log(`[comprobantes] fetching for ${year}-${month}`);
-    debugLog.push(`start: ${page.url()}`);
+    console.log(`[comprobantes] fetching for ${year}-${month}, CUIT: ${userCuit.slice(0,2)}***`);
+    debugLog.push(`start: ${page.url()}, cuit: ${userCuit ? userCuit.slice(0,2) + '***' : 'MISSING'}`);
 
-    // ── STEP 1: Go to the ARCA portal ──
+    if (!userCuit || userCuit.length !== 11) {
+      debugLog.push('ERROR: CUIT missing or invalid');
+      return res.json({ ok: false, error: 'cuit_missing', msg: 'Falta el CUIT para consultar comprobantes.', debugLog });
+    }
+
+    // ── STEP 1: Navigate to the ARCA portal (reuses auth cookies) ──
     await page.goto('https://portalcf.cloud.afip.gob.ar/portal/app/', {
       waitUntil: 'networkidle2', timeout: 30000,
-    }).catch(() => {});
-    await sleep(4000);
-
-    const portalTitle = await page.title().catch(() => '');
-    debugLog.push(`portal: ${page.url()} (${portalTitle})`);
-    console.log(`[comprobantes] portal: ${portalTitle}`);
-
-    // ── STEP 2: Set up popup listener BEFORE clicking ──
-    const popupPromise = new Promise(resolve => {
-      page.once('popup', p => { console.log('[comprobantes] popup caught!'); resolve(p); });
-      setTimeout(() => resolve(null), 20000); // 20s timeout
     });
+    await sleep(3000);
 
-    // ── STEP 3: Find "Mis Comprobantes" and click with REAL mouse ──
-    // Structure: <a class="full-width"><div class="panel-body"><h3>Mis Comprobantes</h3></div></a>
-    const coords = await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll('h3, h4, h5, a, span, div'));
-      const el = els.find(e => /^mis\s*comprobantes$/i.test(e.textContent?.trim()));
-      if (el) {
-        const clickTarget = el.closest('a') || el.closest('[role="button"]') || el;
-        const r = clickTarget.getBoundingClientRect();
-        if (r.width > 0 && r.height > 0) {
-          return { x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2), text: el.textContent.trim(), tag: clickTarget.tagName };
-        }
-      }
-      return null;
-    }).catch(() => null);
+    const portalUrl = page.url();
+    const portalTitle = await page.title().catch(() => '');
+    debugLog.push(`portal: ${portalUrl} (${portalTitle})`);
+    console.log(`[comprobantes] portal loaded: ${portalTitle}`);
 
-    if (coords && coords.x > 0) {
-      debugLog.push(`clicking "${coords.text}" <${coords.tag}> at (${coords.x}, ${coords.y})`);
-      console.log(`[comprobantes] clicking at (${coords.x}, ${coords.y})`);
-      await page.mouse.click(coords.x, coords.y);
-    } else {
-      debugLog.push('element not found, trying JS click');
-      await page.evaluate(() => {
-        const el = Array.from(document.querySelectorAll('h3')).find(e => /mis\s*comprobantes/i.test(e.textContent));
-        if (el) (el.closest('a') || el).click();
-      }).catch(() => {});
-    }
-
-    // ── STEP 4: Wait for the popup (Mis Comprobantes opens in new tab) ──
-    compPage = await popupPromise;
-    debugLog.push(`popup: ${compPage ? 'YES' : 'NO'}`);
-    console.log(`[comprobantes] popup: ${!!compPage}`);
-
-    if (compPage) {
-      // Wait for the comprobantes page to fully load
+    // ── STEP 2: Call portal API to get service info + authorize (creates SSO session) ──
+    const apiResult = await page.evaluate(async (c) => {
       try {
-        await compPage.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-      } catch (_) {}
-      await sleep(4000);
+        // Step A: Get service info
+        const r1 = await fetch(`/portal/api/servicios/${c}/servicio/mcmp`, { credentials: 'include' });
+        const d1 = await r1.json();
 
-      // Wait for DataTable to render
-      await compPage.waitForSelector('table, .dataTables_wrapper', { timeout: 15000 }).catch(() => {});
-      await sleep(2000);
+        // Step B: Authorize — this creates the session on fes.afip.gob.ar
+        const r2 = await fetch(`/portal/api/servicios/${c}/servicio/mcmp/autorizacion`, { credentials: 'include' });
+        const d2 = await r2.json();
 
-      const compUrl = compPage.url();
-      const compTitle = await compPage.title().catch(() => '');
-      debugLog.push(`compPage: ${compUrl} (${compTitle})`);
-      console.log(`[comprobantes] compPage: ${compUrl} title: ${compTitle}`);
-    } else {
-      // Popup didn't open — check if window.open was called but blocked
-      debugLog.push('no popup — checking for URL...');
-      // Try to get the URL from a captured window.open
-      const openUrl = await page.evaluate(() => window.__capturedOpenUrl).catch(() => null);
-      if (openUrl) debugLog.push(`captured URL: ${openUrl}`);
+        return {
+          ok: true,
+          serviceUrl: d1?.servicio?.url || null,
+          serviceName: d1?.servicio?.serviceName || null,
+          adherido: d1?.adherido,
+          hasToken: !!d2?.token,
+          hasSign: !!d2?.sign,
+          tokenLen: d2?.token?.length || 0,
+          signLen: d2?.sign?.length || 0,
+          r1Status: r1.status,
+          r2Status: r2.status,
+        };
+      } catch (e) {
+        return { ok: false, error: e.message };
+      }
+    }, userCuit);
 
-      // As last resort, navigate main page directly
-      debugLog.push('trying direct URL as last resort...');
-      await page.goto('https://fes.afip.gob.ar/mcmp/jsp/index.do', {
-        waitUntil: 'networkidle2', timeout: 30000,
-      }).catch(() => {});
-      await sleep(3000);
-      compPage = page; // use main page
-      debugLog.push(`fallback: ${page.url()} (${await page.title().catch(() => '')})`);
+    debugLog.push(`API result: ${JSON.stringify(apiResult)}`);
+    console.log(`[comprobantes] API result:`, JSON.stringify(apiResult));
+
+    if (!apiResult.ok) {
+      return res.json({ ok: false, error: 'api_error', msg: 'Error al autorizar Mis Comprobantes: ' + (apiResult.error || 'unknown'), debugLog });
     }
 
-    // ── STEP 5: Parse the DataTables table from compPage ──
+    if (!apiResult.hasToken || !apiResult.hasSign) {
+      debugLog.push('WARNING: No token/sign received — session may not be created');
+    }
+
+    // ── STEP 3: Navigate to the Mis Comprobantes service (session now valid) ──
+    const serviceUrl = apiResult.serviceUrl || 'https://fes.afip.gob.ar/mcmp/jsp/index.do';
+    debugLog.push(`navigating to: ${serviceUrl}`);
+    console.log(`[comprobantes] navigating to: ${serviceUrl}`);
+
+    await page.goto(serviceUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+    await sleep(3000);
+
+    const mcmpUrl = page.url();
+    const mcmpTitle = await page.title().catch(() => '');
+    debugLog.push(`mcmp page: ${mcmpUrl} (${mcmpTitle})`);
+    console.log(`[comprobantes] mcmp: ${mcmpUrl} title: ${mcmpTitle}`);
+
+    // Check if session expired
+    const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || '').catch(() => '');
+    if (/sesi[oó]n.*expir/i.test(bodyText)) {
+      debugLog.push('ERROR: Session expired on fes.afip.gob.ar');
+      const shot = await debugShot(page);
+      return res.json({ ok: false, error: 'session_expired_mcmp', msg: 'La sesión en Mis Comprobantes expiró.', debugLog, shot });
+    }
+
+    // ── STEP 4: Wait for DataTables to render ──
+    await page.waitForSelector('table, .dataTables_wrapper, #tablaComprobantes', { timeout: 15000 }).catch(() => {});
+    await sleep(2000);
+
+    // ── STEP 5: Parse the DataTables table ──
     // Headers: Fecha | Tipo | Número | Denominación Emisor | Imp. Total
-    const parsed = await compPage.evaluate(() => {
+    const parsed = await page.evaluate(() => {
       const results = [];
       const tables = document.querySelectorAll('table');
 
@@ -695,26 +701,26 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
           results.push(obj);
         }
       }
-      return results;
-    }).catch(() => []);
+      return { rows: results, tableCount: tables.length, headers: tables.length > 0 ? Array.from(tables[0].querySelectorAll('thead th')).map(t => t.textContent.trim()) : [] };
+    }).catch(() => ({ rows: [], tableCount: 0, headers: [] }));
 
-    debugLog.push(`parsed ${parsed.length} rows`);
-    console.log(`[comprobantes] parsed ${parsed.length} rows`);
-    if (parsed.length > 0) console.log(`[comprobantes] first:`, JSON.stringify(parsed[0]));
+    debugLog.push(`tables found: ${parsed.tableCount}, headers: [${parsed.headers.join(', ')}], rows: ${parsed.rows.length}`);
+    console.log(`[comprobantes] parsed ${parsed.rows.length} rows from ${parsed.tableCount} tables`);
 
-    // ── STEP 6: Handle pagination ──
-    if (parsed.length > 0) {
+    // ── STEP 6: Handle pagination (DataTables "Next" button) ──
+    const allRows = [...parsed.rows];
+    if (allRows.length > 0) {
       let pageNum = 2;
       while (pageNum <= 10) {
-        const hasNext = await compPage.evaluate(() => {
-          const next = document.querySelector('.paginate_button.next:not(.disabled), .next:not(.disabled) a');
+        const hasNext = await page.evaluate(() => {
+          const next = document.querySelector('.paginate_button.next:not(.disabled), .next:not(.disabled) a, a.paginate_button.next:not(.disabled)');
           if (next) { next.click(); return true; }
           return false;
         }).catch(() => false);
         if (!hasNext) break;
         await sleep(2000);
 
-        const moreRows = await compPage.evaluate(() => {
+        const moreRows = await page.evaluate(() => {
           const table = document.querySelector('table thead');
           if (!table) return [];
           const headers = Array.from(table.closest('table').querySelectorAll('thead th')).map(c => c.textContent.trim().toLowerCase());
@@ -728,26 +734,20 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
           }).filter(Boolean);
         }).catch(() => []);
         if (moreRows.length === 0) break;
-        parsed.push(...moreRows);
+        allRows.push(...moreRows);
         debugLog.push(`page ${pageNum}: +${moreRows.length}`);
         pageNum++;
       }
     }
 
-    // Debug: capture page state
-    const bodyPreview = await compPage.evaluate(() => document.body?.innerText?.slice(0, 2000) || '').catch(() => '');
-    const lastShot = await debugShot(compPage);
-    const finalUrl = compPage.url();
-    const finalTitle = await compPage.title().catch(() => '');
-
-    // ── STEP 7: Close popup page to free memory ──
-    if (compPage && compPage !== page) {
-      await compPage.close().catch(() => {});
-      compPage = null;
-    }
+    // Debug info
+    const bodyPreview = await page.evaluate(() => document.body?.innerText?.slice(0, 2000) || '').catch(() => '');
+    const lastShot = await debugShot(page);
+    const finalUrl = page.url();
+    const finalTitle = await page.title().catch(() => '');
 
     // Normalize
-    const normalized = parsed.map((c, idx) => ({
+    const normalized = allRows.map((c, idx) => ({
       id: `arca-${idx}-${Date.now()}`,
       razonSocial: c['denominación emisor'] || c['denominacion emisor'] || c['emisor'] || 'Sin datos',
       tipo: c['tipo'] || '',
@@ -773,8 +773,6 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
 
   } catch (err) {
     console.error('[comprobantes error]', err.message, err.stack);
-    // Clean up popup if it was opened
-    if (compPage && compPage !== page) await compPage.close().catch(() => {});
     const shot = await debugShot(page).catch(() => null);
     res.json({ ok: false, error: 'error_portal', msg: err.message, debugLog, shot });
   }
