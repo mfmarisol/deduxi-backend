@@ -297,8 +297,8 @@ app.post('/api/arca/start', async (req, res) => {
 ───────────────────────────────────────── */
 app.post('/api/arca/complete', async (req, res) => {
   const { sessionId, clave, captchaSolution } = req.body;
-  if (!sessionId || !clave || !captchaSolution)
-    return res.json({ ok: false, error: 'faltan_campos' });
+  if (!sessionId || !clave)
+    return res.json({ ok: false, error: 'faltan_campos', msg: 'Faltan campos requeridos (sessionId, clave).' });
 
   const s = sessions.get(sessionId);
   if (!s)
