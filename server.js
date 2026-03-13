@@ -389,24 +389,23 @@ app.post('/api/arca/complete', async (req, res) => {
         compDebug.push(`A done: ok=${api.ok}, token=${!!api.token}, sign=${!!api.sign}, s1=${api.s1}, s2=${api.s2}, err=${api.err || 'none'}`);
 
         if (api.ok && api.token && api.sign) {
-          // Step B: POST sign+token via form.submit from about:blank
-          // (avoids both SPA interception AND request interception cookie issues)
-          compDebug.push('B: POSTing token+sign via form on blank page...');
+          // Step B: POST sign+token via form.submit from fes domain
+          // Navigate to fes first (keeps afip cookies), then POST from there
+          compDebug.push('B: POSTing token+sign from fes domain...');
           const svcUrl = api.url || 'https://fes.afip.gob.ar/mcmp/jsp/index.do';
 
-          // Navigate to about:blank first (escapes portal SPA)
-          await page.goto('about:blank').catch(() => {});
-          // Inject a form and submit it
-          await page.setContent(`
-            <html><body>
-              <form id="ssoForm" method="POST" action="${svcUrl}">
-                <input type="hidden" name="token" value="${api.token}">
-                <input type="hidden" name="sign" value="${api.sign}">
-              </form>
-            </body></html>
-          `);
+          // First GET to fes domain (will show session expired, but puts us on the right domain with cookies)
+          await page.goto(svcUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          // Now inject form and submit from fes.afip.gob.ar (same origin, all cookies sent, no SPA)
           await Promise.all([
-            page.evaluate(() => document.getElementById('ssoForm').submit()),
+            page.evaluate((url, token, sign) => {
+              document.body.innerHTML = '';
+              const f = document.createElement('form');
+              f.method = 'POST'; f.action = url; f.style.display = 'none';
+              f.innerHTML = '<input name="token" value="' + token + '"><input name="sign" value="' + sign + '">';
+              document.body.appendChild(f);
+              f.submit();
+            }, svcUrl, api.token, api.sign),
             page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {}),
           ]).catch(() => {});
           await sleep(2000);
@@ -430,31 +429,9 @@ app.post('/api/arca/complete', async (req, res) => {
             compDebug.push(`D done: ${page.url()}`);
           }
 
-          // Step D2: Capture page state and click Buscar if needed
+          // Step D2: Capture page state (don't click Buscar — the working version loaded data without it)
           const pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || '').catch(() => '');
-          compDebug.push(`D2 page text: ${pageText.slice(0, 200)}`);
-
-          // Click Buscar/Consultar button if present (page may need explicit search to load results)
-          const buscarResult = await page.evaluate(() => {
-            const btns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a.btn, .btn'));
-            const searchBtn = btns.find(b => {
-              const txt = (b.textContent || b.value || '').toLowerCase();
-              return /buscar|consultar|filtrar|search/.test(txt);
-            });
-            if (searchBtn) { searchBtn.click(); return searchBtn.textContent?.trim() || searchBtn.value || 'clicked'; }
-            // Also try submitting any visible form
-            const form = document.querySelector('form[action*="comprobantes"]');
-            if (form) { form.submit(); return 'form-submit'; }
-            return null;
-          }).catch(() => null);
-          compDebug.push(`D2 buscar: ${buscarResult}`);
-
-          if (buscarResult) {
-            // Wait for page reload/AJAX after clicking Buscar
-            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
-            await sleep(3000);
-            compDebug.push(`D2 after buscar: ${page.url()}`);
-          }
+          compDebug.push(`D2 page: ${pageText.slice(0, 200)}`);
 
           // Step E: Parse HTML table + handle pagination (click Next)
           compDebug.push('E: parsing table with pagination...');
