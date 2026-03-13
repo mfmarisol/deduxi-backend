@@ -610,14 +610,14 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
     debugLog.push(`portal: ${portalUrl} (${portalTitle})`);
     console.log(`[comprobantes] portal loaded: ${portalTitle}`);
 
-    // ── STEP 2: Call portal API to get service info + authorize (creates SSO session) ──
+    // ── STEP 2: Call portal API to get service info + sign/token ──
     const apiResult = await page.evaluate(async (c) => {
       try {
         // Step A: Get service info
         const r1 = await fetch(`/portal/api/servicios/${c}/servicio/mcmp`, { credentials: 'include' });
         const d1 = await r1.json();
 
-        // Step B: Authorize — this creates the session on fes.afip.gob.ar
+        // Step B: Get authorization token + sign
         const r2 = await fetch(`/portal/api/servicios/${c}/servicio/mcmp/autorizacion`, { credentials: 'include' });
         const d2 = await r2.json();
 
@@ -626,6 +626,8 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
           serviceUrl: d1?.servicio?.url || null,
           serviceName: d1?.servicio?.serviceName || null,
           adherido: d1?.adherido,
+          token: d2?.token || null,
+          sign: d2?.sign || null,
           hasToken: !!d2?.token,
           hasSign: !!d2?.sign,
           tokenLen: d2?.token?.length || 0,
@@ -638,8 +640,8 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
       }
     }, userCuit);
 
-    debugLog.push(`API result: ${JSON.stringify(apiResult)}`);
-    console.log(`[comprobantes] API result:`, JSON.stringify(apiResult));
+    debugLog.push(`API result: ok=${apiResult.ok}, hasToken=${apiResult.hasToken}, hasSign=${apiResult.hasSign}, tokenLen=${apiResult.tokenLen}, signLen=${apiResult.signLen}`);
+    console.log(`[comprobantes] API: ok=${apiResult.ok} token=${apiResult.hasToken} sign=${apiResult.hasSign}`);
 
     if (!apiResult.ok) {
       return res.json({ ok: false, error: 'api_error', msg: 'Error al autorizar Mis Comprobantes: ' + (apiResult.error || 'unknown'), debugLog });
@@ -649,12 +651,39 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
       debugLog.push('WARNING: No token/sign received — session may not be created');
     }
 
-    // ── STEP 3: Navigate to the Mis Comprobantes service (session now valid) ──
+    // ── STEP 3: POST sign+token to the service URL via hidden form ──
+    // Portal JS does: wn.postInNewTab(url, {token: t.getToken(), sign: t.getSign()})
+    // which creates a form with method=POST, target=_blank, fields: token, sign
+    // We use _self to stay in the same page (saves memory on Render free tier)
     const serviceUrl = apiResult.serviceUrl || 'https://fes.afip.gob.ar/mcmp/jsp/index.do';
-    debugLog.push(`navigating to: ${serviceUrl}`);
-    console.log(`[comprobantes] navigating to: ${serviceUrl}`);
+    debugLog.push(`POSTing sign+token to: ${serviceUrl}`);
+    console.log(`[comprobantes] POSTing sign+token to: ${serviceUrl}`);
 
-    await page.goto(serviceUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+    // Submit the form and wait for navigation
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
+      page.evaluate((url, token, sign) => {
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = url;
+        form.target = '_self';
+        form.style.display = 'none';
+
+        const addField = (name, value) => {
+          const input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = name;
+          input.value = value || '';
+          form.appendChild(input);
+        };
+
+        addField('token', token);
+        addField('sign', sign);
+
+        document.body.appendChild(form);
+        form.submit();
+      }, serviceUrl, apiResult.token, apiResult.sign),
+    ]);
     await sleep(3000);
 
     const mcmpUrl = page.url();
@@ -662,12 +691,14 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
     debugLog.push(`mcmp page: ${mcmpUrl} (${mcmpTitle})`);
     console.log(`[comprobantes] mcmp: ${mcmpUrl} title: ${mcmpTitle}`);
 
-    // Check if session expired
+    // Check if we landed on the comprobantes page or got session error
     const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || '').catch(() => '');
-    if (/sesi[oó]n.*expir/i.test(bodyText)) {
-      debugLog.push('ERROR: Session expired on fes.afip.gob.ar');
+    debugLog.push(`body preview: ${bodyText.slice(0, 200)}`);
+
+    if (/sesi[oó]n.*expir/i.test(bodyText) || /no est[aá] logueado/i.test(bodyText)) {
+      debugLog.push('ERROR: Session expired after POST');
       const shot = await debugShot(page);
-      return res.json({ ok: false, error: 'session_expired_mcmp', msg: 'La sesión en Mis Comprobantes expiró.', debugLog, shot });
+      return res.json({ ok: false, error: 'session_expired_mcmp', msg: 'No se pudo autenticar en Mis Comprobantes.', debugLog, shot });
     }
 
     // ── STEP 4: Wait for DataTables to render ──
