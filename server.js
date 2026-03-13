@@ -296,7 +296,7 @@ app.post('/api/arca/start', async (req, res) => {
    ← { ok } on success, or error details
 ───────────────────────────────────────── */
 app.post('/api/arca/complete', async (req, res) => {
-  const { sessionId, clave, captchaSolution } = req.body;
+  const { sessionId, clave, captchaSolution, cuit } = req.body;
   if (!sessionId || !clave)
     return res.json({ ok: false, error: 'faltan_campos', msg: 'Faltan campos requeridos (sessionId, clave).' });
 
@@ -355,15 +355,144 @@ app.post('/api/arca/complete', async (req, res) => {
 
     if (loginSucceeded) {
       console.log(`[complete] login OK, landing: ${url}`);
-      // Keep session alive for comprobantes fetching
-      // Store CUIT in session for fetch-comprobantes fallback
-      const sessionCuit = await page.evaluate(() => {
-        // Try to extract CUIT from the portal URL or page content
-        const m = document.body?.innerText?.match(/\b(20|23|24|27|30|33|34)\d{9}\b/);
-        return m ? m[0] : null;
-      }).catch(() => null);
-      sessions.set(sessionId, { browser, page, createdAt: Date.now(), authenticated: true, cuit: sessionCuit });
-      return res.json({ ok: true, arcaSessionId: sessionId, landingUrl: url });
+      const userCuit = (cuit || '').replace(/\D/g, '');
+      sessions.set(sessionId, { browser, page, createdAt: Date.now(), authenticated: true, cuit: userCuit });
+
+      // ─── IMMEDIATELY scrape comprobantes while session is fresh ───
+      const compDebug = [];
+      let comprobantes = [];
+      try {
+        console.log('[complete] scraping comprobantes immediately...');
+        const now = new Date();
+        const yr = now.getFullYear();
+        const mo = String(now.getMonth() + 1).padStart(2, '0');
+
+        // Step A: We're already on the portal — call APIs to get sign+token
+        compDebug.push('A: calling portal APIs...');
+        const api = await page.evaluate(async (c) => {
+          try {
+            const r1 = await fetch(`/portal/api/servicios/${c}/servicio/mcmp`, { credentials: 'include' });
+            const d1 = await r1.json();
+            const r2 = await fetch(`/portal/api/servicios/${c}/servicio/mcmp/autorizacion`, { credentials: 'include' });
+            const d2 = await r2.json();
+            return { ok: true, url: d1?.servicio?.url, token: d2?.token, sign: d2?.sign };
+          } catch (e) { return { ok: false, err: e.message }; }
+        }, userCuit).catch(e => ({ ok: false, err: e.message }));
+
+        compDebug.push(`A done: ok=${api.ok}, token=${!!api.token}, sign=${!!api.sign}`);
+
+        if (api.ok && api.token && api.sign) {
+          // Step B: POST sign+token to service URL
+          compDebug.push('B: POSTing token+sign...');
+          const svcUrl = api.url || 'https://fes.afip.gob.ar/mcmp/jsp/index.do';
+          await page.evaluate((u, t, s) => {
+            const f = document.createElement('form');
+            f.method='POST'; f.action=u; f.style.display='none';
+            [{n:'token',v:t},{n:'sign',v:s}].forEach(({n,v}) => {
+              const i=document.createElement('input'); i.type='hidden'; i.name=n; i.value=v; f.appendChild(i);
+            });
+            document.body.appendChild(f); f.submit();
+          }, svcUrl, api.token, api.sign).catch(() => {});
+          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
+          await sleep(2000);
+          compDebug.push(`B done: ${page.url()}`);
+
+          // Step C: Select contribuyente (idContribuyente=0 = user's own CUIT)
+          compDebug.push('C: selecting contribuyente...');
+          await page.goto('https://fes.afip.gob.ar/mcmp/jsp/setearContribuyente.do?idContribuyente=0', {
+            waitUntil: 'networkidle2', timeout: 20000,
+          }).catch(() => {});
+          await sleep(2000);
+          compDebug.push(`C done: ${page.url()}`);
+
+          // Step D: Go to Comprobantes Recibidos if not already there
+          if (!/comprobantesRecibidos/i.test(page.url())) {
+            compDebug.push('D: navigating to recibidos...');
+            await page.goto('https://fes.afip.gob.ar/mcmp/jsp/comprobantesRecibidos.do', {
+              waitUntil: 'networkidle2', timeout: 20000,
+            }).catch(() => {});
+            await sleep(2000);
+            compDebug.push(`D done: ${page.url()}`);
+          }
+
+          // Step E: Wait for table and parse
+          compDebug.push('E: parsing table...');
+          await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
+          await sleep(1000);
+
+          const parsed = await page.evaluate(() => {
+            const results = [];
+            const tables = document.querySelectorAll('table');
+            for (const table of tables) {
+              const headerRow = table.querySelector('thead tr');
+              if (!headerRow) continue;
+              const headers = Array.from(headerRow.querySelectorAll('th')).map(c => c.textContent.trim().toLowerCase());
+              const hasDate = headers.some(h => /fecha/i.test(h));
+              const hasEmit = headers.some(h => /emisor|denominaci|imp|total/i.test(h));
+              if (!hasDate || !hasEmit) continue;
+              const bodyRows = Array.from(table.querySelectorAll('tbody tr'));
+              for (const row of bodyRows) {
+                const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
+                if (cells.length < 3 || cells.every(c => !c)) continue;
+                const obj = {};
+                headers.forEach((h, i) => { if (i < cells.length) obj[h] = cells[i]; });
+                results.push(obj);
+              }
+            }
+            return { rows: results, tableCount: tables.length };
+          }).catch(() => ({ rows: [], tableCount: 0 }));
+
+          compDebug.push(`E done: ${parsed.rows.length} rows from ${parsed.tableCount} tables`);
+
+          // Step F: Handle pagination
+          const allRows = [...parsed.rows];
+          let pg = 2;
+          while (pg <= 10) {
+            const hasNext = await page.evaluate(() => {
+              const n = document.querySelector('.paginate_button.next:not(.disabled)');
+              if (n) { n.click(); return true; } return false;
+            }).catch(() => false);
+            if (!hasNext) break;
+            await sleep(2000);
+            const more = await page.evaluate(() => {
+              const t = document.querySelector('table thead');
+              if (!t) return [];
+              const hs = Array.from(t.closest('table').querySelectorAll('thead th')).map(c => c.textContent.trim().toLowerCase());
+              return Array.from(t.closest('table').querySelectorAll('tbody tr')).map(r => {
+                const cs = Array.from(r.querySelectorAll('td')).map(c => c.textContent.trim());
+                if (cs.length < 3) return null;
+                const o = {}; hs.forEach((h, i) => { if (i < cs.length) o[h] = cs[i]; }); return o;
+              }).filter(Boolean);
+            }).catch(() => []);
+            if (more.length === 0) break;
+            allRows.push(...more);
+            pg++;
+          }
+
+          // Normalize
+          comprobantes = allRows.map((c, idx) => ({
+            id: `arca-${idx}-${Date.now()}`,
+            razonSocial: c['denominación emisor'] || c['denominacion emisor'] || c['emisor'] || 'Sin datos',
+            tipo: c['tipo'] || '',
+            nroComprobante: c['número'] || c['numero'] || '',
+            fecha: c['fecha'] || '',
+            importeTotal: c['imp. total'] || c['imp.total'] || c['importe total'] || '',
+          }));
+          compDebug.push(`FINAL: ${comprobantes.length} comprobantes`);
+          console.log(`[complete] scraped ${comprobantes.length} comprobantes`);
+        }
+      } catch (compErr) {
+        console.error('[complete] comprobantes error:', compErr.message);
+        compDebug.push(`ERROR: ${compErr.message}`);
+      }
+
+      return res.json({
+        ok: true,
+        arcaSessionId: sessionId,
+        landingUrl: url,
+        comprobantes,
+        compDebug,
+      });
     }
 
     // Still on login page → parse error
