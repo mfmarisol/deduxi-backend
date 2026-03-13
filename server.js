@@ -416,24 +416,56 @@ app.post('/api/arca/complete', async (req, res) => {
           }
 
           // Step E: Wait for table and parse
-          compDebug.push('E: parsing table...');
+          compDebug.push('E: waiting for table...');
           await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
-          await sleep(1000);
+          // DataTables may load data via AJAX — wait extra time
+          await sleep(5000);
 
+          // Debug: capture table structure to understand what we're working with
+          const tableDebug = await page.evaluate(() => {
+            const tables = document.querySelectorAll('table');
+            const info = [];
+            tables.forEach((t, idx) => {
+              const ths = Array.from(t.querySelectorAll('thead th, tr:first-child th')).map(h => h.textContent.trim());
+              const rows = t.querySelectorAll('tbody tr, tr').length;
+              const firstRowCells = t.querySelector('tbody tr, tr:nth-child(2)');
+              const sample = firstRowCells ? Array.from(firstRowCells.querySelectorAll('td, th')).map(c => c.textContent.trim().slice(0, 30)) : [];
+              info.push({ idx, ths, rows, sample, html: t.outerHTML.slice(0, 500) });
+            });
+            const bodyText = document.body?.innerText?.slice(0, 1000) || '';
+            return { tables: info, bodyText };
+          }).catch(() => ({ tables: [], bodyText: '' }));
+
+          compDebug.push(`E tables: ${JSON.stringify(tableDebug.tables.map(t => ({ ths: t.ths, rows: t.rows, sample: t.sample })))}`);
+          compDebug.push(`E body: ${tableDebug.bodyText.slice(0, 300)}`);
+
+          // Parse all tables — be more flexible with header matching
           const parsed = await page.evaluate(() => {
             const results = [];
             const tables = document.querySelectorAll('table');
             for (const table of tables) {
-              const headerRow = table.querySelector('thead tr');
+              // Try thead first, then first row
+              let headerRow = table.querySelector('thead tr');
+              if (!headerRow) headerRow = table.querySelector('tr:first-child');
               if (!headerRow) continue;
-              const headers = Array.from(headerRow.querySelectorAll('th')).map(c => c.textContent.trim().toLowerCase());
+              const headers = Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase());
+              if (headers.length < 3) continue;
+
+              // Check if this looks like a comprobantes table (be flexible)
               const hasDate = headers.some(h => /fecha/i.test(h));
-              const hasEmit = headers.some(h => /emisor|denominaci|imp|total/i.test(h));
-              if (!hasDate || !hasEmit) continue;
-              const bodyRows = Array.from(table.querySelectorAll('tbody tr'));
-              for (const row of bodyRows) {
+              const hasType = headers.some(h => /tipo/i.test(h));
+              const hasAmount = headers.some(h => /imp|total|monto/i.test(h));
+              if (!hasDate && !hasType && !hasAmount) continue;
+
+              // Get all data rows (skip header row)
+              const allRows = Array.from(table.querySelectorAll('tbody tr'));
+              const dataRows = allRows.length > 0 ? allRows : Array.from(table.querySelectorAll('tr')).slice(1);
+
+              for (const row of dataRows) {
                 const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
                 if (cells.length < 3 || cells.every(c => !c)) continue;
+                // Skip "no data" messages
+                if (cells.some(c => /no se encontraron|sin resultados|no hay/i.test(c))) continue;
                 const obj = {};
                 headers.forEach((h, i) => { if (i < cells.length) obj[h] = cells[i]; });
                 results.push(obj);
@@ -442,7 +474,7 @@ app.post('/api/arca/complete', async (req, res) => {
             return { rows: results, tableCount: tables.length };
           }).catch(() => ({ rows: [], tableCount: 0 }));
 
-          compDebug.push(`E done: ${parsed.rows.length} rows from ${parsed.tableCount} tables`);
+          compDebug.push(`E parsed: ${parsed.rows.length} rows`);
 
           // Step F: Handle pagination
           const allRows = [...parsed.rows];
