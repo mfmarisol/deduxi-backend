@@ -702,59 +702,83 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
     }
 
     // ── STEP 3b: Handle contribuyente selection page ──
-    // The page may show "Elegí una persona para ingresar" with a list of entities.
-    // We need to click through to the actual comprobantes.
-    // URL pattern: setearContribuyente.do?idContribuyente=0 → comprobantesRecibidos.do
-    if (/eleg[ií].*persona/i.test(bodyText) || /setearContribuyente/i.test(mcmpUrl) || /index\.do/i.test(mcmpUrl)) {
-      debugLog.push('Contribuyente selection page detected — selecting first entity...');
-      console.log('[comprobantes] Contribuyente selection page — navigating...');
+    // Page shows "Elegí una persona para ingresar" with user's CUIT and entities they represent.
+    // We always select the user's own CUIT (idContribuyente=0 = first/self).
+    // After selection → comprobantesRecibidos.do
+    if (/eleg[ií].*persona/i.test(bodyText) || /index\.do/i.test(mcmpUrl)) {
+      debugLog.push('STEP 3b: Contribuyente selection page detected');
+      console.log('[comprobantes] Contribuyente selection — clicking user CUIT...');
 
-      // Try clicking the first contribuyente link/button, or navigate directly
-      const clicked = await page.evaluate(() => {
-        // Look for links that contain the contribuyente CUIT or "ingresar"
-        const links = Array.from(document.querySelectorAll('a[href*="setearContribuyente"], a[href*="contribuyente"], table a, .btn, button'));
-        for (const link of links) {
-          if (link.href && /setearContribuyente/i.test(link.href)) {
-            link.click();
-            return { clicked: true, href: link.href, text: link.textContent.trim() };
-          }
-        }
-        // Try any clickable row in a table
-        const tableLink = document.querySelector('table tbody tr a, table tbody tr td a');
-        if (tableLink) {
-          tableLink.click();
-          return { clicked: true, href: tableLink.href, text: tableLink.textContent.trim() };
-        }
-        return { clicked: false };
-      }).catch(() => ({ clicked: false }));
-
-      debugLog.push(`click result: ${JSON.stringify(clicked)}`);
-
-      if (clicked.clicked) {
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
-        await sleep(3000);
-      } else {
-        // Fallback: navigate directly to setearContribuyente.do?idContribuyente=0
-        debugLog.push('No clickable link found — trying direct URL...');
-        await page.goto('https://fes.afip.gob.ar/mcmp/jsp/setearContribuyente.do?idContribuyente=0', {
+      // Navigate directly to setearContribuyente with idContribuyente=0 (self)
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {}),
+        page.goto('https://fes.afip.gob.ar/mcmp/jsp/setearContribuyente.do?idContribuyente=0', {
           waitUntil: 'networkidle2', timeout: 20000,
-        }).catch(() => {});
-        await sleep(3000);
-      }
+        }).catch(() => {}),
+      ]);
+      await sleep(3000);
 
       const afterSelectUrl = page.url();
-      const afterSelectTitle = await page.title().catch(() => '');
-      debugLog.push(`after selection: ${afterSelectUrl} (${afterSelectTitle})`);
-      console.log(`[comprobantes] after contribuyente selection: ${afterSelectUrl}`);
-
-      // Check again for session issues
-      const afterBody = await page.evaluate(() => document.body?.innerText?.slice(0, 300) || '').catch(() => '');
-      if (/sesi[oó]n.*expir/i.test(afterBody) || /no est[aá] logueado/i.test(afterBody)) {
-        debugLog.push('ERROR: Session expired after contribuyente selection');
-        const shot = await debugShot(page);
-        return res.json({ ok: false, error: 'session_expired_mcmp', msg: 'Sesión expiró al seleccionar contribuyente.', debugLog, shot });
-      }
+      debugLog.push(`after contribuyente: ${afterSelectUrl}`);
+      console.log(`[comprobantes] after contribuyente: ${afterSelectUrl}`);
     }
+
+    // ── STEP 3c: Make sure we're on Comprobantes Recibidos ──
+    // After contribuyente selection we should land on comprobantesRecibidos.do
+    // If not, navigate there explicitly
+    const currentUrl2 = page.url();
+    if (!/comprobantesRecibidos/i.test(currentUrl2)) {
+      debugLog.push('Not on recibidos page — navigating...');
+      console.log('[comprobantes] Navigating to comprobantesRecibidos...');
+      await page.goto('https://fes.afip.gob.ar/mcmp/jsp/comprobantesRecibidos.do', {
+        waitUntil: 'networkidle2', timeout: 20000,
+      }).catch(() => {});
+      await sleep(3000);
+      debugLog.push(`now at: ${page.url()}`);
+    }
+
+    // ── STEP 3d: Set date filter to current month ──
+    // Date range picker: single input field with format "DD/MM/YYYY - DD/MM/YYYY"
+    const firstDay = `01/${month}/${year}`;
+    const lastDay = new Date(parseInt(year), parseInt(month), 0).getDate();
+    const lastDayStr = `${String(lastDay).padStart(2,'0')}/${month}/${year}`;
+    const dateRange = `${firstDay} - ${lastDayStr}`;
+    debugLog.push(`date filter: ${dateRange}`);
+    console.log(`[comprobantes] setting date filter: ${dateRange}`);
+
+    // Try to set the date range and trigger search
+    await page.evaluate((range) => {
+      // Look for date input (usually an input with daterangepicker or similar)
+      const dateInputs = document.querySelectorAll('input[name*="fecha"], input[name*="date"], input[type="text"], input.form-control');
+      for (const input of dateInputs) {
+        if (input.value && /\d{2}\/\d{2}\/\d{4}.*-.*\d{2}\/\d{2}\/\d{4}/.test(input.value)) {
+          // Found the date range input — update its value
+          const nativeSet = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          nativeSet.call(input, range);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          return { found: true, oldValue: input.value };
+        }
+      }
+      return { found: false, inputCount: dateInputs.length };
+    }, dateRange).catch(() => ({}));
+
+    // Click search/buscar button if present
+    await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button, input[type="submit"], a.btn'));
+      const searchBtn = btns.find(b => /buscar|consultar|filtrar|search/i.test(b.textContent || b.value || ''));
+      if (searchBtn) searchBtn.click();
+    }).catch(() => {});
+    await sleep(3000);
+
+    // Check for errors
+    const bodyText2 = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || '').catch(() => '');
+    if (/sesi[oó]n.*expir/i.test(bodyText2) || /no est[aá] logueado/i.test(bodyText2)) {
+      debugLog.push('ERROR: Session expired');
+      const shot = await debugShot(page);
+      return res.json({ ok: false, error: 'session_expired_mcmp', msg: 'Sesión expiró.', debugLog, shot });
+    }
+    debugLog.push(`ready to parse: ${page.url()}`);
 
     // ── STEP 4: Wait for DataTables to render ──
     await page.waitForSelector('table, .dataTables_wrapper, #tablaComprobantes', { timeout: 15000 }).catch(() => {});
