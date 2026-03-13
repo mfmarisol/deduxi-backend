@@ -364,7 +364,17 @@ app.post('/api/arca/complete', async (req, res) => {
       try {
         console.log('[complete] scraping comprobantes immediately...');
 
-        // Step A: We're already on the portal — call APIs to get sign+token
+        // Step A0: Make sure we're on the portal (after login we might be elsewhere)
+        compDebug.push(`A0: after login at ${page.url()}`);
+        if (!page.url().includes('portalcf.cloud.afip.gob.ar')) {
+          await page.goto('https://portalcf.cloud.afip.gob.ar/portal/app/', {
+            waitUntil: 'networkidle2', timeout: 20000,
+          }).catch(() => {});
+          await sleep(2000);
+          compDebug.push(`A0: navigated to portal: ${page.url()}`);
+        }
+
+        // Step A: Call portal APIs to get sign+token
         compDebug.push('A: calling portal APIs...');
         const api = await page.evaluate(async (c) => {
           try {
@@ -372,11 +382,11 @@ app.post('/api/arca/complete', async (req, res) => {
             const d1 = await r1.json();
             const r2 = await fetch(`/portal/api/servicios/${c}/servicio/mcmp/autorizacion`, { credentials: 'include' });
             const d2 = await r2.json();
-            return { ok: true, url: d1?.servicio?.url, token: d2?.token, sign: d2?.sign };
+            return { ok: true, url: d1?.servicio?.url, token: d2?.token, sign: d2?.sign, s1: r1.status, s2: r2.status };
           } catch (e) { return { ok: false, err: e.message }; }
         }, userCuit).catch(e => ({ ok: false, err: e.message }));
 
-        compDebug.push(`A done: ok=${api.ok}, token=${!!api.token}, sign=${!!api.sign}`);
+        compDebug.push(`A done: ok=${api.ok}, token=${!!api.token}, sign=${!!api.sign}, s1=${api.s1}, s2=${api.s2}, err=${api.err || 'none'}`);
 
         if (api.ok && api.token && api.sign) {
           // Step B: POST sign+token to service URL
