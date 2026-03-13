@@ -364,140 +364,130 @@ app.post('/api/arca/complete', async (req, res) => {
       try {
         console.log('[complete] scraping comprobantes immediately...');
 
-        // Step A0: Make sure we're on the portal (after login we might be elsewhere)
-        compDebug.push(`A0: after login at ${page.url()}`);
+        // Step A: Navigate to portal and call APIs for sign+token
+        compDebug.push(`A: at ${page.url()}`);
         if (!page.url().includes('portalcf.cloud.afip.gob.ar')) {
           await page.goto('https://portalcf.cloud.afip.gob.ar/portal/app/', {
             waitUntil: 'networkidle2', timeout: 20000,
           }).catch(() => {});
           await sleep(2000);
-          compDebug.push(`A0: navigated to portal: ${page.url()}`);
         }
 
-        // Step A: Call portal APIs to get sign+token
-        compDebug.push('A: calling portal APIs...');
         const api = await page.evaluate(async (c) => {
           try {
             const r1 = await fetch(`/portal/api/servicios/${c}/servicio/mcmp`, { credentials: 'include' });
             const d1 = await r1.json();
             const r2 = await fetch(`/portal/api/servicios/${c}/servicio/mcmp/autorizacion`, { credentials: 'include' });
             const d2 = await r2.json();
-            return { ok: true, url: d1?.servicio?.url, token: d2?.token, sign: d2?.sign, s1: r1.status, s2: r2.status };
+            return { ok: true, url: d1?.servicio?.url, token: d2?.token, sign: d2?.sign };
           } catch (e) { return { ok: false, err: e.message }; }
         }, userCuit).catch(e => ({ ok: false, err: e.message }));
 
-        compDebug.push(`A done: ok=${api.ok}, token=${!!api.token}, sign=${!!api.sign}, s1=${api.s1}, s2=${api.s2}, err=${api.err || 'none'}`);
+        compDebug.push(`A: ok=${api.ok}, hasToken=${!!api.token}, hasSign=${!!api.sign}`);
 
         if (api.ok && api.token && api.sign) {
-          // Step B: POST sign+token via form.submit from fes domain
-          // Navigate to fes first (keeps afip cookies), then POST from there
-          compDebug.push('B: POSTing token+sign from fes domain...');
           const svcUrl = api.url || 'https://fes.afip.gob.ar/mcmp/jsp/index.do';
 
-          // First GET to fes domain (will show session expired, but puts us on the right domain with cookies)
-          await page.goto(svcUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-          // Now inject form and submit from fes.afip.gob.ar (same origin, all cookies sent, no SPA)
+          // Step B: POST token+sign via form (EXACT working code with Promise.all)
+          compDebug.push('B: POST form from portal...');
           await Promise.all([
-            page.evaluate((url, token, sign) => {
-              document.body.innerHTML = '';
+            page.evaluate((u, t, s) => {
               const f = document.createElement('form');
-              f.method = 'POST'; f.action = url; f.style.display = 'none';
-              f.innerHTML = '<input name="token" value="' + token + '"><input name="sign" value="' + sign + '">';
-              document.body.appendChild(f);
-              f.submit();
+              f.method = 'POST'; f.action = u; f.style.display = 'none';
+              [{n:'token',v:t},{n:'sign',v:s}].forEach(({n,v}) => {
+                const i = document.createElement('input'); i.type = 'hidden'; i.name = n; i.value = v; f.appendChild(i);
+              });
+              document.body.appendChild(f); f.submit();
             }, svcUrl, api.token, api.sign),
             page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {}),
           ]).catch(() => {});
           await sleep(2000);
-          compDebug.push(`B done: ${page.url()}`);
+          compDebug.push(`B: ${page.url()}`);
 
-          // Step C: Select contribuyente (idContribuyente=0 = user's own CUIT)
-          compDebug.push('C: selecting contribuyente...');
+          // If POST didn't navigate (SPA intercepted), try from blank page
+          if (page.url().includes('portalcf.cloud.afip.gob.ar')) {
+            compDebug.push('B retry: SPA intercepted, trying from blank...');
+            await page.goto('about:blank').catch(() => {});
+            await page.setContent(`<html><body><form id="f" method="POST" action="${svcUrl}"><input name="token" value="${api.token}"><input name="sign" value="${api.sign}"></form></body></html>`);
+            await Promise.all([
+              page.evaluate(() => document.getElementById('f').submit()),
+              page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {}),
+            ]).catch(() => {});
+            await sleep(2000);
+            compDebug.push(`B retry: ${page.url()}`);
+          }
+
+          // Step C: Select contribuyente
           await page.goto('https://fes.afip.gob.ar/mcmp/jsp/setearContribuyente.do?idContribuyente=0', {
             waitUntil: 'networkidle2', timeout: 20000,
           }).catch(() => {});
-          await sleep(2000);
-          compDebug.push(`C done: ${page.url()}`);
+          await sleep(1000);
+          compDebug.push(`C: ${page.url()}`);
 
-          // Step D: Go to Comprobantes Recibidos if not already there
-          if (!/comprobantesRecibidos/i.test(page.url())) {
-            compDebug.push('D: navigating to recibidos...');
-            await page.goto('https://fes.afip.gob.ar/mcmp/jsp/comprobantesRecibidos.do', {
-              waitUntil: 'networkidle2', timeout: 20000,
+          // Step D: Navigate to Comprobantes Recibidos
+          await page.goto('https://fes.afip.gob.ar/mcmp/jsp/comprobantesRecibidos.do', {
+            waitUntil: 'networkidle2', timeout: 20000,
+          }).catch(() => {});
+          await sleep(3000);
+          compDebug.push(`D: ${page.url()}`);
+
+          // Check if page needs Buscar click (tables might be invisible without it)
+          const needsBuscar = await page.evaluate(() => {
+            const tables = document.querySelectorAll('table');
+            const hasVisibleData = Array.from(tables).some(t => t.offsetWidth > 0 && t.querySelectorAll('tbody tr').length > 0);
+            return !hasVisibleData;
+          }).catch(() => true);
+
+          if (needsBuscar) {
+            compDebug.push('D2: clicking Buscar...');
+            await page.evaluate(() => {
+              const btns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a.btn, .btn'));
+              const b = btns.find(b => /buscar|consultar/i.test(b.textContent || b.value || ''));
+              if (b) b.click();
             }).catch(() => {});
-            await sleep(2000);
-            compDebug.push(`D done: ${page.url()}`);
+            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+            await sleep(3000);
+            compDebug.push(`D2: ${page.url()}`);
           }
 
-          // Step D2: Capture page state (don't click Buscar — the working version loaded data without it)
-          const pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || '').catch(() => '');
-          compDebug.push(`D2 page: ${pageText.slice(0, 200)}`);
-
-          // Step E: Parse HTML table + handle pagination (click Next)
-          compDebug.push('E: parsing table with pagination...');
+          // Step E: Parse table
+          compDebug.push('E: parsing...');
           await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
-          await sleep(3000);
+          await sleep(2000);
 
-          // Debug: list all tables on the page
-          const tableSummary = await page.evaluate(() => {
-            return Array.from(document.querySelectorAll('table')).map((t, i) => {
-              const hdr = t.querySelector('thead tr') || t.querySelector('tr:first-child');
-              const headers = hdr ? Array.from(hdr.querySelectorAll('th, td')).map(c => c.textContent.trim()).slice(0, 6) : [];
-              const rows = t.querySelectorAll('tbody tr').length;
-              const vis = t.offsetWidth > 0;
-              return `T${i}:${headers.length}cols,${rows}rows,vis=${vis},[${headers.join('|')}]`;
-            });
-          }).catch(() => []);
-          compDebug.push(`E tables: ${tableSummary.join(' / ')}`);
-
-          // Parse current page — find the VISIBLE DataTables table (5 cols), not the hidden detail table (50+ cols)
           const parseCurrentPage = async () => {
             return page.evaluate(() => {
               const tables = document.querySelectorAll('table');
-              let bestMatch = null;
               for (const table of tables) {
                 const headerRow = table.querySelector('thead tr') || table.querySelector('tr:first-child');
                 if (!headerRow) continue;
                 const headers = Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase());
-                // Skip tables with <4 cols, or too many cols (hidden detail/export table >15)
-                if (headers.length < 4 || headers.length > 15) continue;
-                // Must have BOTH a date column AND an amount/emisor column (to avoid filter/history tables)
-                const hasDate = headers.some(h => h === 'fecha');
-                const hasAmount = headers.some(h => /imp\.|total|importe/i.test(h));
-                const hasEmisor = headers.some(h => /emisor|denominaci/i.test(h));
-                if (!hasDate || (!hasAmount && !hasEmisor)) continue;
+                if (headers.length < 3 || headers.length > 15 || !headers.some(h => /fecha/i.test(h))) continue;
                 const rows = [];
                 for (const row of table.querySelectorAll('tbody tr')) {
                   const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
                   if (cells.length < 3 || cells.every(c => !c)) continue;
-                  if (cells.some(c => /no se encontraron|sin resultados/i.test(c))) continue;
+                  if (cells.some(c => /no se encontraron|sin resultado|no hay dato/i.test(c))) continue;
                   const obj = {};
                   headers.forEach((h, i) => { if (i < cells.length) obj[h] = cells[i]; });
                   rows.push(obj);
                 }
-                // Prefer the table with the most rows
-                if (!bestMatch || rows.length > bestMatch.rows.length) {
-                  bestMatch = { rows, headers };
-                }
+                if (rows.length > 0) return { rows, headers };
               }
-              return bestMatch || { rows: [], headers: [] };
+              return { rows: [], headers: [] };
             }).catch(() => ({ rows: [], headers: [] }));
           };
 
           const firstPage = await parseCurrentPage();
           const allRows = [...firstPage.rows];
-          compDebug.push(`E page1: ${firstPage.rows.length} rows, headers: [${firstPage.headers.join(', ')}]`);
+          compDebug.push(`E page1: ${firstPage.rows.length} rows`);
 
-          // Click "Next" for subsequent pages (DataTables pagination)
+          // Pagination
           let pageNum = 2;
-          while (pageNum <= 20) {
+          while (pageNum <= 20 && allRows.length > 0) {
             const hasNext = await page.evaluate(() => {
-              // DataTables uses .paginate_button.next — check it's not disabled
-              const btns = document.querySelectorAll('.paginate_button.next, .next a, a.paginate_button.next, li.next a, #tablaComprobantes_next');
-              for (const btn of btns) {
-                const isDisabled = btn.classList.contains('disabled') || btn.parentElement?.classList.contains('disabled');
-                if (!isDisabled) { btn.click(); return true; }
-              }
+              const btn = document.querySelector('.paginate_button.next:not(.disabled)');
+              if (btn) { btn.click(); return true; }
               return false;
             }).catch(() => false);
             if (!hasNext) break;
@@ -505,7 +495,7 @@ app.post('/api/arca/complete', async (req, res) => {
             const nextPage = await parseCurrentPage();
             if (nextPage.rows.length === 0) break;
             allRows.push(...nextPage.rows);
-            compDebug.push(`E page${pageNum}: +${nextPage.rows.length} rows`);
+            compDebug.push(`E page${pageNum}: +${nextPage.rows.length}`);
             pageNum++;
           }
 
