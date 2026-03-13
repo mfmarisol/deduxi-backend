@@ -596,12 +596,37 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
     debugLog.push(`portal: ${page.url()} (${portalTitle})`);
     console.log(`[comprobantes] portal loaded: ${portalTitle}`);
 
-    // ── STEP 2: Set up popup listener BEFORE clicking ──
-    // Use both page 'popup' event AND browser 'targetcreated' for maximum compatibility
-    let popupPage = null;
+    // ── STEP 2: Wait for Angular to fully load the portal ──
+    await page.waitForSelector('[ng-click], .card, [ng-repeat]', { timeout: 10000 }).catch(() => {});
+    await sleep(2000);
 
+    // Dump portal structure for debug
+    const portalInfo = await page.evaluate(() => {
+      const cards = Array.from(document.querySelectorAll('[ng-click]'));
+      return cards.map(c => ({
+        tag: c.tagName,
+        text: c.textContent?.trim().slice(0, 80),
+        ngClick: c.getAttribute('ng-click')?.slice(0, 200),
+        rect: c.getBoundingClientRect ? { x: c.getBoundingClientRect().x, y: c.getBoundingClientRect().y, w: c.getBoundingClientRect().width, h: c.getBoundingClientRect().height } : null,
+      })).filter(c => c.text);
+    }).catch(() => []);
+    debugLog.push(`portal ng-click elements: ${portalInfo.length}`);
+    console.log('[comprobantes] portal elements:', JSON.stringify(portalInfo.slice(0, 15)));
+
+    // ── STEP 3: Find "Mis Comprobantes" and get its coordinates for REAL click ──
+    // Also intercept window.open to capture URL
+    await page.evaluate(() => {
+      window.__capturedOpenUrl = null;
+      const origOpen = window.open;
+      window.open = function(url, ...args) {
+        window.__capturedOpenUrl = url;
+        return origOpen.call(window, url, ...args);
+      };
+    });
+
+    // Set up popup listener BEFORE clicking
+    let popupPage = null;
     const popupPromise = new Promise(resolve => {
-      // Method A: page.on('popup') — fires when JS calls window.open
       const popupHandler = (newPage) => {
         console.log('[comprobantes] popup event fired');
         popupPage = newPage;
@@ -609,7 +634,6 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
       };
       page.once('popup', popupHandler);
 
-      // Method B: browser targetcreated — fires for any new tab/window
       const targetHandler = async (target) => {
         if (target.type() === 'page') {
           const p = await target.page().catch(() => null);
@@ -622,7 +646,6 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
       };
       browser.on('targetcreated', targetHandler);
 
-      // Timeout after 15s
       setTimeout(() => {
         page.removeListener('popup', popupHandler);
         browser.removeListener('targetcreated', targetHandler);
@@ -630,108 +653,127 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
       }, 15000);
     });
 
-    // ── STEP 3: Click "Mis Comprobantes" in the portal ──
-    // Also capture the URL in case window.open is called but popup doesn't materialize
-    await page.evaluate(() => {
-      window.__capturedOpenUrl = null;
-      const origOpen = window.open;
-      window.open = function(url, ...args) {
-        window.__capturedOpenUrl = url;
-        return origOpen.call(window, url, ...args); // Let it proceed normally!
-      };
-    });
+    // Find the element coordinates and do a REAL Puppeteer click (mouse events)
+    const clickTarget = await page.evaluate(() => {
+      // Strategy 1: Find by ng-click containing "comprobante"
+      const ngEls = Array.from(document.querySelectorAll('[ng-click]'));
+      const byNg = ngEls.find(el => /comprobante/i.test(el.getAttribute('ng-click') || ''));
+      if (byNg) {
+        const r = byNg.getBoundingClientRect();
+        return { found: true, method: 'ng-click', text: byNg.textContent?.trim().slice(0, 60), x: r.x + r.width/2, y: r.y + r.height/2, ngClick: byNg.getAttribute('ng-click')?.slice(0, 200) };
+      }
 
-    const clickResult = await page.evaluate(() => {
+      // Strategy 2: Find by text "Mis Comprobantes" on leaf nodes
       const allEls = Array.from(document.querySelectorAll('*'));
-      // Find the exact "Mis Comprobantes" text node
-      const misComp = allEls.find(el => {
+      const textEl = allEls.find(el => {
         const text = el.textContent?.trim();
         return text && /^mis\s*comprobantes$/i.test(text) && el.children.length === 0;
-      }) || allEls.find(el => {
-        const text = el.textContent?.trim();
-        return text && /^mis\s*comprobantes$/i.test(text);
       });
-      if (misComp) {
-        const clickable = misComp.closest('[ng-click]') || misComp.closest('[onclick]') ||
-                          misComp.closest('a[href]') || misComp.closest('button') ||
-                          misComp.closest('.card') || misComp.closest('[role="button"]') ||
-                          misComp.parentElement?.parentElement?.parentElement || misComp;
+      if (textEl) {
+        // Walk up to find the clickable parent (ng-click or card)
+        const clickable = textEl.closest('[ng-click]') || textEl.closest('a') || textEl.closest('button') ||
+                          textEl.closest('.card') || textEl.closest('[role="button"]') || textEl;
+        const r = clickable.getBoundingClientRect();
         const attrs = {};
         for (const a of (clickable.attributes || [])) attrs[a.name] = a.value.slice(0, 200);
-        clickable.click();
-        return { found: true, text: misComp.textContent.trim(), tag: clickable.tagName, attrs };
+        return { found: true, method: 'text-match', text: textEl.textContent.trim(), tag: clickable.tagName, x: r.x + r.width/2, y: r.y + r.height/2, attrs };
       }
-      // Fallback: find by partial text match
-      const partial = allEls.find(el => {
+
+      // Strategy 3: Broader text match
+      const broader = allEls.find(el => {
         const text = el.textContent?.trim().toLowerCase();
-        return text && text.includes('mis comprobantes') && text.length < 30 && el.children.length === 0;
+        return text && text.includes('mis comprobantes') && text.length < 40 && el.children.length <= 2;
       });
-      if (partial) {
-        partial.click();
-        return { found: true, text: partial.textContent.trim(), tag: partial.tagName, partial: true };
+      if (broader) {
+        const clickable = broader.closest('[ng-click]') || broader;
+        const r = clickable.getBoundingClientRect();
+        return { found: true, method: 'broad-text', text: broader.textContent.trim().slice(0, 60), x: r.x + r.width/2, y: r.y + r.height/2 };
       }
+
       return { found: false };
     }).catch(err => ({ error: err.message }));
 
-    debugLog.push(`click: ${JSON.stringify(clickResult)}`);
-    console.log(`[comprobantes] click:`, JSON.stringify(clickResult));
+    debugLog.push(`clickTarget: ${JSON.stringify(clickTarget)}`);
+    console.log(`[comprobantes] clickTarget:`, JSON.stringify(clickTarget));
 
-    // ── STEP 4: Wait for popup or fallback to captured URL ──
+    if (clickTarget.found && clickTarget.x > 0 && clickTarget.y > 0) {
+      // Use REAL Puppeteer mouse click — this triggers Angular event handlers properly
+      await page.mouse.click(clickTarget.x, clickTarget.y);
+      debugLog.push(`real click at (${clickTarget.x}, ${clickTarget.y})`);
+      console.log(`[comprobantes] real click at (${clickTarget.x}, ${clickTarget.y})`);
+    } else if (clickTarget.found) {
+      // Fallback: JS click via evaluate
+      await page.evaluate(() => {
+        const ngEls = Array.from(document.querySelectorAll('[ng-click]'));
+        const byNg = ngEls.find(el => /comprobante/i.test(el.getAttribute('ng-click') || ''));
+        if (byNg) { byNg.click(); return; }
+        const allEls = Array.from(document.querySelectorAll('*'));
+        const textEl = allEls.find(el => /^mis\s*comprobantes$/i.test(el.textContent?.trim()) && el.children.length === 0);
+        if (textEl) { const c = textEl.closest('[ng-click]') || textEl; c.click(); }
+      });
+      debugLog.push('fallback JS click');
+    }
+
+    await sleep(5000); // Give Angular time to process the click and open the service
+
+    // ── STEP 4: Check what happened — popup, captured URL, or navigation ──
     const popup = await popupPromise;
     const capturedUrl = await page.evaluate(() => window.__capturedOpenUrl).catch(() => null);
-    debugLog.push(`popup: ${popup ? 'yes' : 'no'}, capturedUrl: ${capturedUrl || 'none'}`);
-    console.log(`[comprobantes] popup=${!!popup}, capturedUrl=${capturedUrl}`);
+    const currentUrl = page.url();
+    debugLog.push(`popup: ${popup ? 'yes' : 'no'}, capturedUrl: ${capturedUrl || 'none'}, currentUrl: ${currentUrl}`);
+    console.log(`[comprobantes] popup=${!!popup}, capturedUrl=${capturedUrl}, currentUrl=${currentUrl}`);
 
     let compPage = null;
 
     if (popup) {
-      // We got the popup — wait for it to fully load
       compPage = popup;
       debugLog.push('using popup page');
-      await compPage.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+      try {
+        await compPage.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+      } catch (_) {}
       await sleep(3000);
     } else if (capturedUrl) {
-      // window.open was called but popup didn't materialize — open in a new page
-      debugLog.push(`opening captured URL in new tab: ${capturedUrl}`);
+      debugLog.push(`opening captured URL: ${capturedUrl}`);
       compPage = await browser.newPage();
-      // Copy cookies from main page to new page (same browser, so cookies should transfer)
       await compPage.setViewport({ width: 1280, height: 900 });
-      await compPage.setUserAgent(
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      );
       await compPage.goto(capturedUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
       await sleep(3000);
     } else {
-      // Neither popup nor captured URL — try direct known URL as last resort
-      debugLog.push('no popup, no captured URL — trying direct URL');
-      const directUrls = [
-        'https://fe.afip.gob.ar/rcel/jsp/buscarComprobantes.do',
-        'https://fe.afip.gob.ar/rcel/jsp/consultaComprobantes.jsp',
-        'https://serviciosweb.afip.gob.ar/genericos/comprobantes/',
-      ];
-      compPage = await browser.newPage();
-      await compPage.setViewport({ width: 1280, height: 900 });
-      await compPage.setUserAgent(
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      );
-      let directWorked = false;
-      for (const url of directUrls) {
-        try {
-          await compPage.goto(url, { waitUntil: 'networkidle2', timeout: 15000 });
-          const status = await compPage.evaluate(() => document.title || '');
-          debugLog.push(`tried ${url} → title: ${status}`);
-          if (status && !/error|404|403|not found/i.test(status)) {
-            directWorked = true;
-            break;
-          }
-        } catch (e) {
-          debugLog.push(`tried ${url} → error: ${e.message}`);
-        }
-      }
-      if (!directWorked) {
-        // Use the main page as fallback
-        await compPage.close().catch(() => {});
+      // Check if the page URL changed (maybe navigation instead of popup)
+      if (currentUrl !== 'https://portalcf.cloud.afip.gob.ar/portal/app/' &&
+          currentUrl !== 'about:blank') {
+        debugLog.push('page navigated to: ' + currentUrl);
         compPage = page;
+      } else {
+        // Try to extract the service URL from Angular scope
+        const angularUrl = await page.evaluate(() => {
+          try {
+            const scope = angular.element(document.querySelector('[ng-controller]')).scope();
+            if (scope && scope.servicios) {
+              const comp = scope.servicios.find(s => /comprobante/i.test(s.desc || s.nombre || s.titulo || ''));
+              if (comp) return comp.url || comp.link || comp.href || JSON.stringify(comp);
+            }
+          } catch (_) {}
+          // Also try to find URLs in script tags or inline JS
+          const scripts = document.querySelectorAll('script');
+          for (const s of scripts) {
+            const match = s.textContent?.match(/https?:\/\/[^"'\s]+comprobante[^"'\s]*/i);
+            if (match) return match[0];
+          }
+          return null;
+        }).catch(() => null);
+
+        if (angularUrl && angularUrl.startsWith('http')) {
+          debugLog.push(`angular scope URL: ${angularUrl}`);
+          compPage = await browser.newPage();
+          await compPage.setViewport({ width: 1280, height: 900 });
+          await compPage.goto(angularUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+          await sleep(3000);
+        } else {
+          debugLog.push('no popup, no URL — using portal page as fallback');
+          if (angularUrl) debugLog.push(`angular data: ${angularUrl}`);
+          compPage = page;
+        }
       }
     }
 
