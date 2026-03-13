@@ -566,11 +566,11 @@ app.get('/debug/arca-step2', async (req, res) => {
    Body: { sessionId, periodo: "2026-03" }
    Strategy:
      1. Navigate to ARCA portal
-     2. Click "Mis Comprobantes" — let the popup open naturally
-     3. Capture the popup page via Puppeteer's 'popup' event
-     4. On the comprobantes page, click "Recibidos", set dates, click search
-     5. Parse the HTML table with results
-   ← { ok, comprobantes: [...], debug info }
+     2. Monitor network requests for service redirect URLs
+     3. Click "Mis Comprobantes" with real mouse
+     4. Capture redirect URL from network, navigate to it
+     5. On comprobantes page: click Recibidos, set dates, search, parse table
+   All on the SAME page — no extra tabs/pages (saves memory on Render free tier)
 ───────────────────────────────────────── */
 app.post('/api/arca/fetch-comprobantes', async (req, res) => {
   const { sessionId, periodo } = req.body;
@@ -584,476 +584,273 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
 
   try {
     console.log(`[comprobantes] fetching for ${year}-${month}`);
+    debugLog.push(`start: ${page.url()}`);
 
     // ── STEP 1: Go to the ARCA portal ──
-    debugLog.push(`current url: ${page.url()}`);
     await page.goto('https://portalcf.cloud.afip.gob.ar/portal/app/', {
       waitUntil: 'networkidle2', timeout: 30000,
     }).catch(() => {});
     await sleep(3000);
 
-    const portalTitle = await page.title().catch(() => '');
-    debugLog.push(`portal: ${page.url()} (${portalTitle})`);
-    console.log(`[comprobantes] portal loaded: ${portalTitle}`);
-
-    // ── STEP 2: Wait for Angular to fully load the portal ──
+    // Wait for Angular to render
     await page.waitForSelector('[ng-click], .card, [ng-repeat]', { timeout: 10000 }).catch(() => {});
     await sleep(2000);
 
-    // Dump portal structure for debug
+    const portalUrl = page.url();
+    const portalTitle = await page.title().catch(() => '');
+    debugLog.push(`portal: ${portalUrl} (${portalTitle})`);
+
+    // Take screenshot of portal for debug
+    const portalShot = await debugShot(page);
+
+    // ── STEP 2: Find all ng-click elements and locate "Mis Comprobantes" ──
     const portalInfo = await page.evaluate(() => {
       const cards = Array.from(document.querySelectorAll('[ng-click]'));
       return cards.map(c => ({
-        tag: c.tagName,
         text: c.textContent?.trim().slice(0, 80),
         ngClick: c.getAttribute('ng-click')?.slice(0, 200),
-        rect: c.getBoundingClientRect ? { x: c.getBoundingClientRect().x, y: c.getBoundingClientRect().y, w: c.getBoundingClientRect().width, h: c.getBoundingClientRect().height } : null,
-      })).filter(c => c.text);
+        x: Math.round(c.getBoundingClientRect().x + c.getBoundingClientRect().width / 2),
+        y: Math.round(c.getBoundingClientRect().y + c.getBoundingClientRect().height / 2),
+        w: Math.round(c.getBoundingClientRect().width),
+        h: Math.round(c.getBoundingClientRect().height),
+      })).filter(c => c.text && c.w > 0);
     }).catch(() => []);
-    debugLog.push(`portal ng-click elements: ${portalInfo.length}`);
-    console.log('[comprobantes] portal elements:', JSON.stringify(portalInfo.slice(0, 15)));
 
-    // ── STEP 3: Find "Mis Comprobantes" and get its coordinates for REAL click ──
-    // Also intercept window.open to capture URL
+    debugLog.push(`ng-click elements: ${portalInfo.length}`);
+    portalInfo.forEach((p, i) => debugLog.push(`  [${i}] "${p.text.slice(0,40)}" ng-click="${(p.ngClick||'').slice(0,60)}" at (${p.x},${p.y})`));
+    console.log('[comprobantes] portal elements:', JSON.stringify(portalInfo.slice(0, 10)));
+
+    // ── STEP 3: Intercept window.open + monitor network requests ──
+    const capturedUrls = [];
     await page.evaluate(() => {
       window.__capturedOpenUrl = null;
       const origOpen = window.open;
       window.open = function(url, ...args) {
         window.__capturedOpenUrl = url;
-        return origOpen.call(window, url, ...args);
+        // Block the popup to save memory — we'll navigate manually
+        return null;
       };
     });
 
-    // Set up popup listener BEFORE clicking
-    let popupPage = null;
-    const popupPromise = new Promise(resolve => {
-      const popupHandler = (newPage) => {
-        console.log('[comprobantes] popup event fired');
-        popupPage = newPage;
-        resolve(newPage);
-      };
-      page.once('popup', popupHandler);
-
-      const targetHandler = async (target) => {
-        if (target.type() === 'page') {
-          const p = await target.page().catch(() => null);
-          if (p && !popupPage) {
-            console.log('[comprobantes] targetcreated event fired');
-            popupPage = p;
-            resolve(p);
-          }
-        }
-      };
-      browser.on('targetcreated', targetHandler);
-
-      setTimeout(() => {
-        page.removeListener('popup', popupHandler);
-        browser.removeListener('targetcreated', targetHandler);
-        resolve(null);
-      }, 15000);
-    });
-
-    // Find the element coordinates and do a REAL Puppeteer click (mouse events)
-    const clickTarget = await page.evaluate(() => {
-      // Strategy 1: Find by ng-click containing "comprobante"
-      const ngEls = Array.from(document.querySelectorAll('[ng-click]'));
-      const byNg = ngEls.find(el => /comprobante/i.test(el.getAttribute('ng-click') || ''));
-      if (byNg) {
-        const r = byNg.getBoundingClientRect();
-        return { found: true, method: 'ng-click', text: byNg.textContent?.trim().slice(0, 60), x: r.x + r.width/2, y: r.y + r.height/2, ngClick: byNg.getAttribute('ng-click')?.slice(0, 200) };
+    // Monitor network for redirect URLs (the portal API returns service URLs)
+    const networkUrls = [];
+    const requestHandler = (request) => {
+      const url = request.url();
+      if (/rcel|comprobante|fe\.afip/i.test(url)) {
+        networkUrls.push(url);
+        console.log(`[comprobantes] network: ${url}`);
       }
+    };
+    page.on('request', requestHandler);
 
-      // Strategy 2: Find by text "Mis Comprobantes" on leaf nodes
-      const allEls = Array.from(document.querySelectorAll('*'));
-      const textEl = allEls.find(el => {
-        const text = el.textContent?.trim();
-        return text && /^mis\s*comprobantes$/i.test(text) && el.children.length === 0;
-      });
-      if (textEl) {
-        // Walk up to find the clickable parent (ng-click or card)
-        const clickable = textEl.closest('[ng-click]') || textEl.closest('a') || textEl.closest('button') ||
-                          textEl.closest('.card') || textEl.closest('[role="button"]') || textEl;
-        const r = clickable.getBoundingClientRect();
-        const attrs = {};
-        for (const a of (clickable.attributes || [])) attrs[a.name] = a.value.slice(0, 200);
-        return { found: true, method: 'text-match', text: textEl.textContent.trim(), tag: clickable.tagName, x: r.x + r.width/2, y: r.y + r.height/2, attrs };
-      }
-
-      // Strategy 3: Broader text match
-      const broader = allEls.find(el => {
-        const text = el.textContent?.trim().toLowerCase();
-        return text && text.includes('mis comprobantes') && text.length < 40 && el.children.length <= 2;
-      });
-      if (broader) {
-        const clickable = broader.closest('[ng-click]') || broader;
-        const r = clickable.getBoundingClientRect();
-        return { found: true, method: 'broad-text', text: broader.textContent.trim().slice(0, 60), x: r.x + r.width/2, y: r.y + r.height/2 };
-      }
-
-      return { found: false };
-    }).catch(err => ({ error: err.message }));
-
-    debugLog.push(`clickTarget: ${JSON.stringify(clickTarget)}`);
-    console.log(`[comprobantes] clickTarget:`, JSON.stringify(clickTarget));
-
-    if (clickTarget.found && clickTarget.x > 0 && clickTarget.y > 0) {
-      // Use REAL Puppeteer mouse click — this triggers Angular event handlers properly
-      await page.mouse.click(clickTarget.x, clickTarget.y);
-      debugLog.push(`real click at (${clickTarget.x}, ${clickTarget.y})`);
-      console.log(`[comprobantes] real click at (${clickTarget.x}, ${clickTarget.y})`);
-    } else if (clickTarget.found) {
-      // Fallback: JS click via evaluate
-      await page.evaluate(() => {
-        const ngEls = Array.from(document.querySelectorAll('[ng-click]'));
-        const byNg = ngEls.find(el => /comprobante/i.test(el.getAttribute('ng-click') || ''));
-        if (byNg) { byNg.click(); return; }
-        const allEls = Array.from(document.querySelectorAll('*'));
-        const textEl = allEls.find(el => /^mis\s*comprobantes$/i.test(el.textContent?.trim()) && el.children.length === 0);
-        if (textEl) { const c = textEl.closest('[ng-click]') || textEl; c.click(); }
-      });
-      debugLog.push('fallback JS click');
+    // ── STEP 4: Click "Mis Comprobantes" ──
+    // First try: find by ng-click containing comprobante
+    let clickedOk = false;
+    const compEl = portalInfo.find(p => /comprobante/i.test(p.ngClick || ''));
+    if (compEl && compEl.x > 0 && compEl.y > 0) {
+      debugLog.push(`clicking ng-click element at (${compEl.x}, ${compEl.y}): "${compEl.text.slice(0,40)}"`);
+      await page.mouse.click(compEl.x, compEl.y);
+      clickedOk = true;
     }
 
-    await sleep(5000); // Give Angular time to process the click and open the service
+    // Second try: find by text content
+    if (!clickedOk) {
+      const textEl = portalInfo.find(p => /mis\s*comprobantes/i.test(p.text));
+      if (textEl && textEl.x > 0 && textEl.y > 0) {
+        debugLog.push(`clicking text element at (${textEl.x}, ${textEl.y}): "${textEl.text.slice(0,40)}"`);
+        await page.mouse.click(textEl.x, textEl.y);
+        clickedOk = true;
+      }
+    }
 
-    // ── STEP 4: Check what happened — popup, captured URL, or navigation ──
-    const popup = await popupPromise;
+    // Third try: JS click fallback
+    if (!clickedOk) {
+      const jsResult = await page.evaluate(() => {
+        const allEls = Array.from(document.querySelectorAll('*'));
+        const el = allEls.find(e => /^mis\s*comprobantes$/i.test(e.textContent?.trim()) && e.children.length === 0);
+        if (el) {
+          const c = el.closest('[ng-click]') || el;
+          c.click();
+          return 'JS click: ' + el.textContent.trim();
+        }
+        return null;
+      }).catch(() => null);
+      debugLog.push(jsResult || 'no element found to click');
+    }
+
+    // Wait for navigation/popup/network
+    await sleep(6000);
+    page.removeListener('request', requestHandler);
+
+    // Check what we captured
     const capturedUrl = await page.evaluate(() => window.__capturedOpenUrl).catch(() => null);
     const currentUrl = page.url();
-    debugLog.push(`popup: ${popup ? 'yes' : 'no'}, capturedUrl: ${capturedUrl || 'none'}, currentUrl: ${currentUrl}`);
-    console.log(`[comprobantes] popup=${!!popup}, capturedUrl=${capturedUrl}, currentUrl=${currentUrl}`);
 
-    let compPage = null;
+    debugLog.push(`capturedUrl: ${capturedUrl || 'none'}`);
+    debugLog.push(`networkUrls: ${JSON.stringify(networkUrls)}`);
+    debugLog.push(`currentUrl: ${currentUrl}`);
+    console.log(`[comprobantes] captured=${capturedUrl}, network=${networkUrls.length}, current=${currentUrl}`);
 
-    if (popup) {
-      compPage = popup;
-      debugLog.push('using popup page');
-      try {
-        await compPage.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-      } catch (_) {}
-      await sleep(3000);
-    } else if (capturedUrl) {
-      debugLog.push(`opening captured URL: ${capturedUrl}`);
-      compPage = await browser.newPage();
-      await compPage.setViewport({ width: 1280, height: 900 });
-      await compPage.goto(capturedUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-      await sleep(3000);
-    } else {
-      // Check if the page URL changed (maybe navigation instead of popup)
-      if (currentUrl !== 'https://portalcf.cloud.afip.gob.ar/portal/app/' &&
-          currentUrl !== 'about:blank') {
-        debugLog.push('page navigated to: ' + currentUrl);
-        compPage = page;
-      } else {
-        // Try to extract the service URL from Angular scope
-        const angularUrl = await page.evaluate(() => {
-          try {
-            const scope = angular.element(document.querySelector('[ng-controller]')).scope();
-            if (scope && scope.servicios) {
-              const comp = scope.servicios.find(s => /comprobante/i.test(s.desc || s.nombre || s.titulo || ''));
-              if (comp) return comp.url || comp.link || comp.href || JSON.stringify(comp);
-            }
-          } catch (_) {}
-          // Also try to find URLs in script tags or inline JS
-          const scripts = document.querySelectorAll('script');
-          for (const s of scripts) {
-            const match = s.textContent?.match(/https?:\/\/[^"'\s]+comprobante[^"'\s]*/i);
-            if (match) return match[0];
+    // ── STEP 5: Navigate to the comprobantes service ──
+    let serviceUrl = capturedUrl || networkUrls.find(u => /rcel|comprobante/i.test(u)) || null;
+
+    // If we didn't get a URL, try to extract from Angular scope
+    if (!serviceUrl) {
+      const angularData = await page.evaluate(() => {
+        try {
+          // Try to find Angular scope with service data
+          const el = document.querySelector('[ng-controller]') || document.querySelector('[ng-app]');
+          if (el) {
+            const scope = angular.element(el).scope();
+            // Walk all scope properties to find service info
+            const found = [];
+            const check = (obj, depth) => {
+              if (!obj || depth > 3) return;
+              for (const key of Object.keys(obj)) {
+                if (key.startsWith('$')) continue;
+                const val = obj[key];
+                if (typeof val === 'string' && /comprobante/i.test(val)) found.push({ key, val: val.slice(0, 200) });
+                if (typeof val === 'object' && val) {
+                  const str = JSON.stringify(val).slice(0, 500);
+                  if (/comprobante/i.test(str)) found.push({ key, val: str.slice(0, 200) });
+                }
+              }
+            };
+            check(scope, 0);
+            return found;
           }
-          return null;
-        }).catch(() => null);
+        } catch (e) { return [{ error: e.message }]; }
+        return [];
+      }).catch(() => []);
 
-        if (angularUrl && angularUrl.startsWith('http')) {
-          debugLog.push(`angular scope URL: ${angularUrl}`);
-          compPage = await browser.newPage();
-          await compPage.setViewport({ width: 1280, height: 900 });
-          await compPage.goto(angularUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-          await sleep(3000);
-        } else {
-          debugLog.push('no popup, no URL — using portal page as fallback');
-          if (angularUrl) debugLog.push(`angular data: ${angularUrl}`);
-          compPage = page;
-        }
-      }
+      debugLog.push(`angular scope: ${JSON.stringify(angularData)}`);
     }
 
-    let lastUrl = compPage.url();
-    let lastTitle = await compPage.title().catch(() => '');
-    debugLog.push(`comp page: ${lastUrl} (${lastTitle})`);
-    console.log(`[comprobantes] comp page: ${lastUrl} title: ${lastTitle}`);
+    if (serviceUrl) {
+      debugLog.push(`navigating to service: ${serviceUrl}`);
+      console.log(`[comprobantes] navigating to: ${serviceUrl}`);
+      await page.goto(serviceUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+      await sleep(3000);
+    } else if (currentUrl !== portalUrl) {
+      debugLog.push(`page changed to: ${currentUrl}`);
+    } else {
+      debugLog.push('no service URL found — still on portal');
+    }
 
-    // ── STEP 5: If we're on a comprobantes page, interact with the form ──
-    // Look for "Recibidos" tab/link and click it
-    const clickRecib = await compPage.evaluate(() => {
-      const els = Array.from(document.querySelectorAll('a, button, li, span, div, input[type="button"], input[type="submit"], label, tab, [role="tab"]'));
+    // ── STEP 6: We should now be on the comprobantes page ──
+    let lastUrl = page.url();
+    let lastTitle = await page.title().catch(() => '');
+    debugLog.push(`page now: ${lastUrl} (${lastTitle})`);
+
+    // Click "Recibidos" if present
+    const recibResult = await page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll('a, button, li, span, [role="tab"]'));
       const recib = els.find(el => /recib/i.test(el.textContent?.trim()) && el.textContent.trim().length < 40);
       if (recib) {
-        const clickable = recib.closest('a') || recib.closest('button') || recib.closest('li') || recib.closest('[role="tab"]') || recib;
-        clickable.click();
-        return `clicked: ${recib.textContent.trim()} (${clickable.tagName})`;
+        (recib.closest('a') || recib.closest('button') || recib.closest('li') || recib).click();
+        return recib.textContent.trim();
       }
       return null;
     }).catch(() => null);
-
-    if (clickRecib) {
-      debugLog.push(`recibidos: ${clickRecib}`);
-      console.log(`[comprobantes] ${clickRecib}`);
+    if (recibResult) {
+      debugLog.push(`clicked Recibidos: ${recibResult}`);
       await sleep(3000);
     }
 
-    // ── STEP 6: Set date range and search ──
+    // ── STEP 7: Set date range and search ──
     const lastDay = new Date(parseInt(year), parseInt(month), 0).getDate();
     const fechaDesde = `01/${month}/${year}`;
     const fechaHasta = `${lastDay}/${month}/${year}`;
 
-    const dateResult = await compPage.evaluate((desde, hasta, y, m) => {
+    const dateResult = await page.evaluate((desde, hasta) => {
       const results = [];
-      const allInputs = Array.from(document.querySelectorAll('input, select'));
+      const inputs = Array.from(document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button])'));
 
-      // Strategy A: Find date inputs by name/id/placeholder
-      const dateInputs = allInputs.filter(el =>
-        el.type !== 'hidden' && el.type !== 'submit' && el.type !== 'button' &&
-        /fecha|date|desde|hasta|inicio|fin|period/i.test(el.id + el.name + (el.placeholder || '') + (el.getAttribute('aria-label') || ''))
+      // Find date inputs
+      const dateInputs = inputs.filter(el =>
+        /fecha|date|desde|hasta/i.test(el.id + el.name + (el.placeholder || ''))
       );
 
-      // If we have exactly 2 date inputs, assume first=desde second=hasta
+      // If 2+ date inputs, set them
       if (dateInputs.length >= 2) {
-        const setVal = (inp, val) => {
-          inp.value = val;
-          inp.dispatchEvent(new Event('input', { bubbles: true }));
-          inp.dispatchEvent(new Event('change', { bubbles: true }));
-          inp.dispatchEvent(new Event('blur', { bubbles: true }));
-        };
-        setVal(dateInputs[0], desde);
-        setVal(dateInputs[1], hasta);
-        results.push(`dates: ${desde} - ${hasta} (by position)`);
+        const set = (inp, val) => { inp.value = val; inp.dispatchEvent(new Event('input', {bubbles:true})); inp.dispatchEvent(new Event('change', {bubbles:true})); };
+        set(dateInputs[0], desde);
+        set(dateInputs[1], hasta);
+        results.push(`dates: ${desde} - ${hasta}`);
       } else {
-        // Try matching by keyword
-        for (const inp of dateInputs) {
-          const key = (inp.id + inp.name + (inp.placeholder || '')).toLowerCase();
-          if (/desde|inicio|from|start/i.test(key)) {
-            inp.value = desde;
-            inp.dispatchEvent(new Event('change', { bubbles: true }));
-            results.push(`desde=${desde}`);
-          } else if (/hasta|fin|end|to/i.test(key)) {
-            inp.value = hasta;
-            inp.dispatchEvent(new Event('change', { bubbles: true }));
-            results.push(`hasta=${hasta}`);
-          }
+        // Try inputs with dd/mm/yyyy pattern
+        const patterned = inputs.filter(el => /^\d{2}\/\d{2}\/\d{4}$/.test(el.value));
+        if (patterned.length >= 2) {
+          patterned[0].value = desde; patterned[0].dispatchEvent(new Event('change', {bubbles:true}));
+          patterned[1].value = hasta; patterned[1].dispatchEvent(new Event('change', {bubbles:true}));
+          results.push(`dates by pattern: ${desde} - ${hasta}`);
         }
       }
 
-      // Also try any generic date-looking inputs (dd/mm/yyyy format in value)
-      if (results.length === 0) {
-        const possibleDates = allInputs.filter(el =>
-          el.type === 'text' && /^\d{2}\/\d{2}\/\d{4}$/.test(el.value)
-        );
-        if (possibleDates.length >= 2) {
-          possibleDates[0].value = desde;
-          possibleDates[0].dispatchEvent(new Event('change', { bubbles: true }));
-          possibleDates[1].value = hasta;
-          possibleDates[1].dispatchEvent(new Event('change', { bubbles: true }));
-          results.push(`dates by value pattern: ${desde} - ${hasta}`);
-        }
-      }
+      // Click search
+      const btns = Array.from(document.querySelectorAll('input[type=submit], input[type=button], button'));
+      const searchBtn = btns.find(b => /buscar|consultar/i.test((b.textContent||'') + (b.value||'')));
+      if (searchBtn) { searchBtn.click(); results.push(`search: ${searchBtn.value || searchBtn.textContent?.trim()}`); }
 
-      // Month/year selects
-      const selects = allInputs.filter(el => el.tagName === 'SELECT');
-      for (const sel of selects) {
-        const opts = Array.from(sel.options).map(o => o.text.toLowerCase());
-        if (opts.some(o => /enero|febrero|marzo|abril|mayo|junio/i.test(o))) {
-          const monthNames = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
-          const monthIdx = parseInt(m) - 1;
-          for (let i = 0; i < sel.options.length; i++) {
-            if (sel.options[i].text.toLowerCase().includes(monthNames[monthIdx]) ||
-                sel.options[i].value === m || sel.options[i].value === String(parseInt(m))) {
-              sel.selectedIndex = i;
-              sel.dispatchEvent(new Event('change', { bubbles: true }));
-              results.push(`month=${sel.options[i].text}`);
-              break;
-            }
-          }
-        }
-      }
+      return results;
+    }, fechaDesde, fechaHasta).catch(e => [e.message]);
 
-      // Click Buscar/Consultar button
-      const btns = Array.from(document.querySelectorAll('input[type="submit"], input[type="button"], button'));
-      const searchBtn = btns.find(b =>
-        /buscar|consultar|search|filtrar/i.test((b.textContent || '') + (b.value || ''))
-      );
-      if (searchBtn) {
-        searchBtn.click();
-        results.push(`search: ${searchBtn.value || searchBtn.textContent?.trim()}`);
-      }
-
-      // Also list all visible inputs for debug
-      const inputInfo = allInputs
-        .filter(el => el.offsetWidth > 0 && el.type !== 'hidden')
-        .map(el => ({ id: el.id, name: el.name, type: el.type, val: el.value?.slice(0, 30) }))
-        .slice(0, 20);
-
-      return { actions: results, inputs: inputInfo };
-    }, fechaDesde, fechaHasta, year, month).catch(e => ({ error: e.message }));
-
-    debugLog.push(`dates: ${JSON.stringify(dateResult?.actions || dateResult)}`);
-    console.log(`[comprobantes] date result:`, JSON.stringify(dateResult));
-
-    if (dateResult?.actions?.length > 0) {
+    debugLog.push(`dates: ${JSON.stringify(dateResult)}`);
+    if (dateResult.length > 0) {
       await sleep(4000);
-      await compPage.waitForNetworkIdle({ timeout: 10000 }).catch(() => {});
-      await sleep(2000);
+      await page.waitForNetworkIdle({ timeout: 8000 }).catch(() => {});
     }
 
-    // ── STEP 7: Parse comprobantes from the page ──
-    // The ARCA page uses a DataTable with headers:
-    // Fecha | Tipo | Número | Denominación Emisor | Imp. Total
-    const parsed = await compPage.evaluate(() => {
+    // ── STEP 8: Parse comprobantes table ──
+    const parsed = await page.evaluate(() => {
       const results = [];
-
-      // Strategy 1: HTML tables — find the one with comprobante-like headers
       const tables = document.querySelectorAll('table');
       for (const table of tables) {
         const headerRow = table.querySelector('thead tr') || table.querySelector('tr');
         if (!headerRow) continue;
         const headers = Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase());
+        if (headers.length < 3) continue;
+        // Skip portal/nav tables
+        if (headers.some(h => /novedades|alertas|portal|menú/i.test(h))) continue;
 
-        // Check if this looks like a comprobantes table
-        const isCompTable = headers.some(h => /fecha/i.test(h)) &&
-                           headers.some(h => /tipo|n[uú]mero|emisor|importe|imp/i.test(h));
-
-        if (!isCompTable && tables.length > 1) continue; // Skip non-comprobante tables if multiple
-
-        // Parse body rows
         const bodyRows = table.querySelector('tbody')
           ? Array.from(table.querySelectorAll('tbody tr'))
           : Array.from(table.querySelectorAll('tr')).slice(1);
 
         for (const row of bodyRows) {
           const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
-          if (cells.length < 2) continue;
-          // Skip rows that look like headers or empty
-          if (cells.every(c => !c || c.length === 0)) continue;
-
-          const obj = {};
-          headers.forEach((h, idx) => { if (idx < cells.length) obj[h] = cells[idx]; });
-          obj._raw = cells.join(' | ');
-          obj._source = 'table';
-          obj._headerCount = headers.length;
-          // Only include rows that have at least one number (date or amount)
-          if (cells.some(c => /\d/.test(c))) results.push(obj);
+          if (cells.length < 3 || cells.every(c => !c)) continue;
+          if (cells.some(c => /\d/.test(c))) {
+            const obj = {};
+            headers.forEach((h, i) => { if (i < cells.length) obj[h] = cells[i]; });
+            obj._raw = cells.join(' | ');
+            results.push(obj);
+          }
         }
       }
-
-      // Strategy 2: div/card based (Angular apps)
-      if (results.length === 0) {
-        const cards = document.querySelectorAll('[class*="comprobante"], [class*="resultado"], .dataTables_wrapper tr, [role="row"]');
-        cards.forEach(card => {
-          const text = card.innerText?.trim();
-          if (text && text.length > 10 && /\d/.test(text) && !/novedades|alertas|portal/i.test(text)) {
-            results.push({ _raw: text.replace(/\n/g, ' | '), _source: 'card' });
-          }
-        });
-      }
-
-      // Strategy 3: DataTables specific
-      if (results.length === 0) {
-        const dtRows = document.querySelectorAll('.dataTable tbody tr, #dataTable tbody tr, table.display tbody tr');
-        dtRows.forEach(row => {
-          const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
-          if (cells.length >= 3 && cells.some(c => /\d/.test(c))) {
-            results.push({ _raw: cells.join(' | '), _source: 'datatable', cells });
-          }
-        });
-      }
-
-      return results.slice(0, 100);
+      return results.slice(0, 50);
     }).catch(() => []);
 
     debugLog.push(`parsed ${parsed.length} rows`);
-    console.log(`[comprobantes] parsed ${parsed.length} rows`);
-    if (parsed.length > 0) console.log(`[comprobantes] sample:`, JSON.stringify(parsed[0]));
 
-    // ── STEP 8: If we got results, check if there are more pages ──
-    if (parsed.length > 0) {
-      // Try to get all pages of results
-      const hasMorePages = await compPage.evaluate(() => {
-        const pagination = document.querySelector('.paginate_button.next:not(.disabled), .pagination .next:not(.disabled), a[aria-label="Next"]');
-        return !!pagination;
-      }).catch(() => false);
+    // Debug: capture page state
+    const bodyPreview = await page.evaluate(() => document.body?.innerText?.slice(0, 2000) || '').catch(() => '');
+    const lastShot = await debugShot(page);
+    lastUrl = page.url();
+    lastTitle = await page.title().catch(() => '');
 
-      if (hasMorePages) {
-        debugLog.push('pagination detected, clicking next...');
-        let pageNum = 2;
-        let maxPages = 5; // safety limit
-        while (pageNum <= maxPages) {
-          const clicked = await compPage.evaluate(() => {
-            const nextBtn = document.querySelector('.paginate_button.next:not(.disabled), .pagination .next:not(.disabled) a, a[aria-label="Next"]');
-            if (nextBtn) { nextBtn.click(); return true; }
-            return false;
-          }).catch(() => false);
+    // Normalize
+    const normalized = parsed.map((c, idx) => ({
+      id: `arca-${idx}-${Date.now()}`,
+      razonSocial: c['denominación emisor'] || c['denominacion emisor'] || c['emisor'] || c['razón social'] || c['razon social'] || 'Sin datos',
+      tipo: c['tipo'] || c['tipo comp.'] || '',
+      nroComprobante: c['número'] || c['numero'] || c['nro.'] || c['nro'] || '',
+      fecha: c['fecha'] || '',
+      importeTotal: c['imp. total'] || c['imp.total'] || c['importe total'] || c['importe'] || c['total'] || '',
+      _raw: c._raw || '',
+    }));
 
-          if (!clicked) break;
-          await sleep(2000);
-
-          const moreRows = await compPage.evaluate(() => {
-            const results = [];
-            const table = document.querySelector('table');
-            if (!table) return results;
-            const headerRow = table.querySelector('thead tr') || table.querySelector('tr');
-            const headers = headerRow ? Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase()) : [];
-            const bodyRows = table.querySelector('tbody')
-              ? Array.from(table.querySelectorAll('tbody tr'))
-              : Array.from(table.querySelectorAll('tr')).slice(1);
-            for (const row of bodyRows) {
-              const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
-              if (cells.length < 2 || cells.every(c => !c)) continue;
-              const obj = {};
-              headers.forEach((h, idx) => { if (idx < cells.length) obj[h] = cells[idx]; });
-              obj._raw = cells.join(' | ');
-              obj._source = 'table';
-              if (cells.some(c => /\d/.test(c))) results.push(obj);
-            }
-            return results;
-          }).catch(() => []);
-
-          if (moreRows.length === 0) break;
-          parsed.push(...moreRows);
-          debugLog.push(`page ${pageNum}: +${moreRows.length} rows`);
-          pageNum++;
-        }
-      }
-    }
-
-    // Capture debug info
-    const lastBodyPreview = await compPage.evaluate(() => document.body?.innerText?.slice(0, 2000) || '').catch(() => '');
-    const lastShot = await debugShot(compPage);
-    lastUrl = compPage.url();
-    lastTitle = await compPage.title().catch(() => '');
-
-    // Close extra pages
-    if (compPage !== page) {
-      // Keep compPage alive for debug but close later
-      await compPage.close().catch(() => {});
-    }
-
-    // ── STEP 9: Normalize comprobantes ──
-    const normalized = parsed.map((c, idx) => {
-      const raw = c._raw || '';
-      return {
-        id: `arca-${idx}-${Date.now()}`,
-        razonSocial: c['denominación emisor'] || c['denominacion emisor'] || c['razón social'] || c['razon social'] ||
-                     c['emisor'] || c['denominación'] || c['denominacion'] || c['receptor'] ||
-                     raw.split('|')[3]?.trim() || raw.split('|')[0]?.trim() || 'Sin datos',
-        tipo: c['tipo'] || c['tipo comp.'] || c['comprobante'] || c['tipo comprobante'] || raw.split('|')[1]?.trim() || '',
-        nroComprobante: c['número'] || c['numero'] || c['nro.'] || c['nro'] || c['punto de vta.'] || raw.split('|')[2]?.trim() || '',
-        fecha: c['fecha'] || c['fecha emisión'] || c['fecha emision'] || c['fecha de emisión'] || raw.split('|')[0]?.trim() || '',
-        importeTotal: c['imp. total'] || c['imp.total'] || c['importe total'] || c['importe'] || c['monto'] || c['total'] || '',
-        _raw: raw,
-      };
-    });
-
-    console.log(`[comprobantes] FINAL: ${normalized.length} comprobantes`);
-    debugLog.push(`FINAL: ${normalized.length} comprobantes`);
+    console.log(`[comprobantes] FINAL: ${normalized.length} comprobantes, log: ${debugLog.join(' | ')}`);
 
     return res.json({
       ok: true,
@@ -1061,15 +858,15 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
       title: lastTitle,
       urlAfterNav: lastUrl,
       comprobantes: normalized,
-      shot: normalized.length === 0 ? lastShot : null,
-      pageBodyPreview: normalized.length === 0 ? lastBodyPreview?.slice(0, 1500) : undefined,
+      shot: normalized.length === 0 ? lastShot : (portalShot || null),
+      pageBodyPreview: normalized.length === 0 ? bodyPreview?.slice(0, 1500) : undefined,
       debugLog,
-      dateInputs: dateResult?.inputs || null,
     });
 
   } catch (err) {
-    console.error('[comprobantes error]', err.message);
-    res.json({ ok: false, error: 'error_portal', msg: 'Error al navegar el portal de ARCA: ' + err.message, debugLog });
+    console.error('[comprobantes error]', err.message, err.stack);
+    const shot = await debugShot(page).catch(() => null);
+    res.json({ ok: false, error: 'error_portal', msg: err.message, debugLog, shot });
   }
 });
 
