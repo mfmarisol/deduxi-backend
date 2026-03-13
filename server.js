@@ -599,32 +599,135 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
       return res.json({ ok: false, error: 'sesion_expirada', msg: 'La sesión de ARCA expiró. Volvé a conectar.' });
     }
 
-    // 2. Take debug screenshot + list all links to understand the portal
-    const shot = await page.screenshot({ encoding: 'base64' }).catch(() => null);
+    // 2. Take debug screenshot + list all links/inputs to understand the portal
     const title = await page.title().catch(() => '');
-    const links = await page.$$eval('a', els => els.map(a => ({ text: a.textContent.trim().slice(0, 60), href: a.href.slice(0, 100) }))).catch(() => []);
-    const inputs = await page.$$eval('input,select', els => els.map(el => ({ tag: el.tagName, id: el.id, name: el.name, type: el.type || '', visible: el.offsetWidth > 0 }))).catch(() => []);
+    console.log(`[comprobantes] title: ${title}, url: ${urlAfterNav}`);
 
-    console.log(`[comprobantes] title: ${title}`);
-    console.log(`[comprobantes] links: ${JSON.stringify(links.slice(0, 20))}`);
-    console.log(`[comprobantes] inputs: ${JSON.stringify(inputs)}`);
+    // Try to gather page info
+    const pageInfo = await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a')).map(a => ({
+        text: a.textContent.trim().slice(0, 80), href: a.href.slice(0, 150)
+      }));
+      const inputs = Array.from(document.querySelectorAll('input,select,button')).map(el => ({
+        tag: el.tagName, id: el.id, name: el.name, type: el.type || '',
+        visible: el.offsetWidth > 0, value: el.value?.slice(0, 50)
+      }));
+      const tables = Array.from(document.querySelectorAll('table')).map(t => ({
+        rows: t.rows.length,
+        firstRowText: t.rows[0]?.textContent?.trim().slice(0, 200) || ''
+      }));
+      const bodyText = document.body?.innerText?.slice(0, 3000) || '';
+      return { links: links.slice(0, 40), inputs, tables, bodyText };
+    }).catch(() => ({ links: [], inputs: [], tables: [], bodyText: '' }));
 
-    // 3. Look for "Recibidos" / comprobantes link
-    const recibidosLink = links.find(l =>
-      /recib/i.test(l.text) || /recib/i.test(l.href) || /receptor/i.test(l.text)
-    );
-    console.log('[comprobantes] recibidos link:', JSON.stringify(recibidosLink));
+    console.log(`[comprobantes] tables: ${JSON.stringify(pageInfo.tables)}`);
+    console.log(`[comprobantes] body preview: ${pageInfo.bodyText.slice(0, 500)}`);
 
-    // Return debug info for now so we can understand the portal structure
+    // 3. Try to find and click "Recibidos" tab/link if available
+    const clickedRecibidos = await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a, button, input[type="submit"], input[type="button"]'));
+      const recib = links.find(el => /recib/i.test(el.textContent) || /recib/i.test(el.value || ''));
+      if (recib) { recib.click(); return recib.textContent?.trim() || recib.value || 'clicked'; }
+      return null;
+    }).catch(() => null);
+
+    if (clickedRecibidos) {
+      console.log(`[comprobantes] clicked recibidos: ${clickedRecibidos}`);
+      await sleep(3000);
+      await page.waitForNetworkIdle({ timeout: 10000 }).catch(() => {});
+    }
+
+    // 4. Try to set date range for the current month
+    const dateSet = await page.evaluate((y, m) => {
+      const results = [];
+      // Look for date inputs (fechaDesde, fechaHasta, etc.)
+      const dateInputs = Array.from(document.querySelectorAll('input')).filter(el =>
+        /fecha|date|desde|hasta|inicio|fin/i.test(el.id + el.name)
+      );
+      for (const inp of dateInputs) {
+        const isDesde = /desde|inicio|from|start/i.test(inp.id + inp.name);
+        const isHasta = /hasta|fin|end|to/i.test(inp.id + inp.name);
+        if (isDesde) {
+          inp.value = `01/${m}/${y}`;
+          inp.dispatchEvent(new Event('change', { bubbles: true }));
+          results.push(`desde: 01/${m}/${y}`);
+        } else if (isHasta) {
+          const lastDay = new Date(parseInt(y), parseInt(m), 0).getDate();
+          inp.value = `${lastDay}/${m}/${y}`;
+          inp.dispatchEvent(new Event('change', { bubbles: true }));
+          results.push(`hasta: ${lastDay}/${m}/${y}`);
+        }
+      }
+      // Try to find and click search/buscar button
+      const btns = Array.from(document.querySelectorAll('input[type="submit"], input[type="button"], button'));
+      const searchBtn = btns.find(b => /buscar|consultar|search|filtrar/i.test(b.textContent + (b.value || '')));
+      if (searchBtn) { searchBtn.click(); results.push('clicked search'); }
+      return results;
+    }, year, month).catch(() => []);
+
+    if (dateSet.length > 0) {
+      console.log(`[comprobantes] date set: ${JSON.stringify(dateSet)}`);
+      await sleep(3000);
+      await page.waitForNetworkIdle({ timeout: 10000 }).catch(() => {});
+    }
+
+    // 5. Try to parse comprobantes from any table on the page
+    const comprobantes = await page.evaluate(() => {
+      const results = [];
+      const tables = document.querySelectorAll('table');
+      for (const table of tables) {
+        const rows = Array.from(table.querySelectorAll('tr'));
+        if (rows.length < 2) continue; // skip tables with no data rows
+        // Try to find header row
+        const headerRow = rows[0];
+        const headers = Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase());
+        // Look for tables that have comprobante-like headers
+        const hasRelevantHeaders = headers.some(h => /fecha|emisor|razon|tipo|importe|monto|comprobante|nro|numero/i.test(h));
+        if (!hasRelevantHeaders && rows.length < 5) continue;
+
+        for (let i = 1; i < rows.length; i++) {
+          const cells = Array.from(rows[i].querySelectorAll('td')).map(c => c.textContent.trim());
+          if (cells.length < 2) continue;
+          // Try to extract fields based on position or header mapping
+          const obj = {};
+          headers.forEach((h, idx) => {
+            if (idx < cells.length) obj[h] = cells[idx];
+          });
+          // Also store raw cells
+          obj._raw = cells.join(' | ');
+          if (cells.some(c => /\d/.test(c))) results.push(obj);
+        }
+      }
+      return results.slice(0, 50);
+    }).catch(() => []);
+
+    console.log(`[comprobantes] parsed ${comprobantes.length} rows`);
+
+    // Take debug screenshot
+    const shot = await page.screenshot({ encoding: 'base64' }).catch(() => null);
+
+    // Map parsed data to normalized comprobantes format
+    const normalizedComprobantes = comprobantes.map((c, idx) => {
+      const raw = c._raw || '';
+      return {
+        id: `arca-${idx}-${Date.now()}`,
+        razonSocial: c['razón social'] || c['razon social'] || c['emisor'] || c['denominación'] || c['denominacion'] || raw.split('|')[0]?.trim() || 'Sin datos',
+        tipo: c['tipo'] || c['tipo comp.'] || c['comprobante'] || '',
+        nroComprobante: c['nro.'] || c['número'] || c['numero'] || c['nro'] || c['punto de vta.'] || '',
+        fecha: c['fecha'] || c['fecha emisión'] || c['fecha emision'] || '',
+        importeTotal: c['imp. total'] || c['importe'] || c['monto'] || c['total'] || c['imp.total'] || '',
+        _raw: raw,
+      };
+    });
+
     return res.json({
       ok: true,
-      debug: true,
+      debug: comprobantes.length === 0,
       title,
-      urlAfterNav,
-      links: links.slice(0, 30),
-      inputs,
-      shot,
-      comprobantes: [], // will be filled in next iteration
+      urlAfterNav: page.url(),
+      comprobantes: normalizedComprobantes,
+      shot: comprobantes.length === 0 ? shot : null, // only send screenshot if no data found
+      pageBodyPreview: comprobantes.length === 0 ? pageInfo.bodyText.slice(0, 1000) : undefined,
     });
 
   } catch (err) {
