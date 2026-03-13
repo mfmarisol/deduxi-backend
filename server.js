@@ -438,15 +438,18 @@ app.post('/api/arca/complete', async (req, res) => {
           await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
           await sleep(3000);
 
-          // Parse current page
+          // Parse current page — find the VISIBLE DataTables table (5 cols), not the hidden detail table (50+ cols)
           const parseCurrentPage = async () => {
             return page.evaluate(() => {
               const tables = document.querySelectorAll('table');
+              let bestMatch = null;
               for (const table of tables) {
                 const headerRow = table.querySelector('thead tr') || table.querySelector('tr:first-child');
                 if (!headerRow) continue;
                 const headers = Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase());
-                if (headers.length < 3 || !headers.some(h => /fecha/i.test(h))) continue;
+                // Skip tables with <3 cols, no "fecha", or too many cols (hidden detail/export table)
+                if (headers.length < 3 || headers.length > 15) continue;
+                if (!headers.some(h => /fecha/i.test(h))) continue;
                 const rows = [];
                 for (const row of table.querySelectorAll('tbody tr')) {
                   const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
@@ -456,9 +459,12 @@ app.post('/api/arca/complete', async (req, res) => {
                   headers.forEach((h, i) => { if (i < cells.length) obj[h] = cells[i]; });
                   rows.push(obj);
                 }
-                return { rows, headers };
+                // Prefer the table with the most rows
+                if (!bestMatch || rows.length > bestMatch.rows.length) {
+                  bestMatch = { rows, headers };
+                }
               }
-              return { rows: [], headers: [] };
+              return bestMatch || { rows: [], headers: [] };
             }).catch(() => ({ rows: [], headers: [] }));
           };
 
