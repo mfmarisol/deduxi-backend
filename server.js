@@ -406,7 +406,7 @@ app.post('/api/arca/complete', async (req, res) => {
           } catch (navErr) {
             compDebug.push(`B nav error: ${navErr.message}`);
           }
-          page.removeListener('request', reqHandler);
+          page.off('request', reqHandler);
           await page.setRequestInterception(false);
           await sleep(2000);
           compDebug.push(`B done: ${page.url()}`);
