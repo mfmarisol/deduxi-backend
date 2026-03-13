@@ -417,45 +417,58 @@ app.post('/api/arca/complete', async (req, res) => {
             compDebug.push(`D done: ${page.url()}`);
           }
 
-          // Step D2: Set date filter to full current month before loading data
-          // Use today as end date — ARCA only has data up to yesterday
+          // Step D2: Use jQuery daterangepicker API to set full month range
+          // The default range is just yesterday — we want 01/MM/YYYY to today
           const today = new Date();
           const dateFrom = `01/${mo}/${yr}`;
           const dateTo = `${String(today.getDate()).padStart(2,'0')}/${String(today.getMonth()+1).padStart(2,'0')}/${today.getFullYear()}`;
-          const dateRange = `${dateFrom} - ${dateTo}`;
-          compDebug.push(`D2: setting date range: ${dateRange}`);
+          compDebug.push(`D2: setting date ${dateFrom} to ${dateTo}`);
 
-          const dateResult = await page.evaluate((range, from, to) => {
-            // Look for date range input
-            const inputs = document.querySelectorAll('input[type="text"], input.form-control, input[name*="fecha"], input[name*="date"]');
-            for (const input of inputs) {
-              // Date range inputs typically contain "DD/MM/YYYY - DD/MM/YYYY"
-              if (/\d{2}\/\d{2}\/\d{4}/.test(input.value) || input.id?.includes('fecha') || input.name?.includes('fecha')) {
-                const old = input.value;
-                // Use native setter to trigger change events
-                const nativeSet = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                nativeSet.call(input, range);
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-                // Also try jQuery trigger if available
-                if (window.jQuery) window.jQuery(input).trigger('change').trigger('apply.daterangepicker');
-                return { found: true, old, now: range, id: input.id, name: input.name };
+          const dateResult = await page.evaluate((from, to) => {
+            try {
+              const $ = window.jQuery;
+              if (!$) return { ok: false, reason: 'no jQuery' };
+              // Find the daterangepicker input
+              const drpInput = $('input[name*="fecha"], input.daterangepicker-input, input[id*="fecha"]').first();
+              if (!drpInput.length) {
+                // Try any input with a daterangepicker attached
+                const allInputs = $('input').filter(function() { return $(this).data('daterangepicker'); });
+                if (!allInputs.length) return { ok: false, reason: 'no daterangepicker input found' };
+                const drp = allInputs.first().data('daterangepicker');
+                const moment = window.moment;
+                if (drp && moment) {
+                  drp.setStartDate(moment(from, 'DD/MM/YYYY'));
+                  drp.setEndDate(moment(to, 'DD/MM/YYYY'));
+                  allInputs.first().trigger('apply.daterangepicker', drp);
+                  return { ok: true, method: 'drp-api-filtered' };
+                }
+                return { ok: false, reason: 'no drp data on filtered inputs' };
               }
-            }
-            return { found: false, inputCount: inputs.length };
-          }, dateRange, dateFrom, dateTo).catch(e => ({ found: false, err: e.message }));
+              const drp = drpInput.data('daterangepicker');
+              const moment = window.moment;
+              if (drp && moment) {
+                drp.setStartDate(moment(from, 'DD/MM/YYYY'));
+                drp.setEndDate(moment(to, 'DD/MM/YYYY'));
+                drpInput.trigger('apply.daterangepicker', drp);
+                return { ok: true, method: 'drp-api' };
+              }
+              return { ok: false, reason: 'no drp or moment' };
+            } catch(e) { return { ok: false, reason: e.message }; }
+          }, dateFrom, dateTo).catch(e => ({ ok: false, reason: e.message }));
 
-          compDebug.push(`D2 date: ${JSON.stringify(dateResult)}`);
+          compDebug.push(`D2 result: ${JSON.stringify(dateResult)}`);
 
-          // Click search/buscar/consultar button if present
-          if (dateResult.found) {
+          if (dateResult.ok) {
+            // Click Buscar to reload table with new date range
             await page.evaluate(() => {
               const btns = Array.from(document.querySelectorAll('button, input[type="submit"], a.btn, .btn'));
               const searchBtn = btns.find(b => /buscar|consultar|filtrar|search/i.test(b.textContent || b.value || ''));
-              if (searchBtn) { searchBtn.click(); return searchBtn.textContent.trim(); }
-              return null;
+              if (searchBtn) searchBtn.click();
             }).catch(() => {});
-            await sleep(5000); // wait for table to reload with new date range
+            await sleep(5000);
+          } else {
+            compDebug.push('D2 skipped — using default date range');
+            // Default date range still shows comprobantes, so we proceed
           }
 
           // Step E: Parse HTML table + handle pagination (click Next)
@@ -491,12 +504,16 @@ app.post('/api/arca/complete', async (req, res) => {
           const allRows = [...firstPage.rows];
           compDebug.push(`E page1: ${firstPage.rows.length} rows, headers: [${firstPage.headers.join(', ')}]`);
 
-          // Click "Next" for subsequent pages
+          // Click "Next" for subsequent pages (DataTables pagination)
           let pageNum = 2;
-          while (pageNum <= 20 && allRows.length > 0) {
+          while (pageNum <= 20) {
             const hasNext = await page.evaluate(() => {
-              const nextBtn = document.querySelector('.paginate_button.next:not(.disabled), .next:not(.disabled) a, a.paginate_button.next:not(.disabled), li.next:not(.disabled) a');
-              if (nextBtn) { nextBtn.click(); return true; }
+              // DataTables uses .paginate_button.next — check it's not disabled
+              const btns = document.querySelectorAll('.paginate_button.next, .next a, a.paginate_button.next, li.next a, #tablaComprobantes_next');
+              for (const btn of btns) {
+                const isDisabled = btn.classList.contains('disabled') || btn.parentElement?.classList.contains('disabled');
+                if (!isDisabled) { btn.click(); return true; }
+              }
               return false;
             }).catch(() => false);
             if (!hasNext) break;
