@@ -415,101 +415,163 @@ app.post('/api/arca/complete', async (req, res) => {
             compDebug.push(`D done: ${page.url()}`);
           }
 
-          // Step E: Wait for table and parse
-          compDebug.push('E: waiting for table...');
-          await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
-          // DataTables may load data via AJAX — wait extra time
-          await sleep(5000);
+          // Step D2: Set date filter to full current month before loading data
+          const lastDay = new Date(parseInt(yr), parseInt(mo), 0).getDate();
+          const dateFrom = `01/${mo}/${yr}`;
+          const dateTo = `${String(lastDay).padStart(2,'0')}/${mo}/${yr}`;
+          const dateRange = `${dateFrom} - ${dateTo}`;
+          compDebug.push(`D2: setting date range: ${dateRange}`);
 
-          // Debug: capture table structure to understand what we're working with
-          const tableDebug = await page.evaluate(() => {
-            const tables = document.querySelectorAll('table');
-            const info = [];
-            tables.forEach((t, idx) => {
-              const ths = Array.from(t.querySelectorAll('thead th, tr:first-child th')).map(h => h.textContent.trim());
-              const rows = t.querySelectorAll('tbody tr, tr').length;
-              const firstRowCells = t.querySelector('tbody tr, tr:nth-child(2)');
-              const sample = firstRowCells ? Array.from(firstRowCells.querySelectorAll('td, th')).map(c => c.textContent.trim().slice(0, 30)) : [];
-              info.push({ idx, ths, rows, sample, html: t.outerHTML.slice(0, 500) });
-            });
-            const bodyText = document.body?.innerText?.slice(0, 1000) || '';
-            return { tables: info, bodyText };
-          }).catch(() => ({ tables: [], bodyText: '' }));
-
-          compDebug.push(`E tables: ${JSON.stringify(tableDebug.tables.map(t => ({ ths: t.ths, rows: t.rows, sample: t.sample })))}`);
-          compDebug.push(`E body: ${tableDebug.bodyText.slice(0, 300)}`);
-
-          // Parse all tables — be more flexible with header matching
-          const parsed = await page.evaluate(() => {
-            const results = [];
-            const tables = document.querySelectorAll('table');
-            for (const table of tables) {
-              // Try thead first, then first row
-              let headerRow = table.querySelector('thead tr');
-              if (!headerRow) headerRow = table.querySelector('tr:first-child');
-              if (!headerRow) continue;
-              const headers = Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase());
-              if (headers.length < 3) continue;
-
-              // Check if this looks like a comprobantes table (be flexible)
-              const hasDate = headers.some(h => /fecha/i.test(h));
-              const hasType = headers.some(h => /tipo/i.test(h));
-              const hasAmount = headers.some(h => /imp|total|monto/i.test(h));
-              if (!hasDate && !hasType && !hasAmount) continue;
-
-              // Get all data rows (skip header row)
-              const allRows = Array.from(table.querySelectorAll('tbody tr'));
-              const dataRows = allRows.length > 0 ? allRows : Array.from(table.querySelectorAll('tr')).slice(1);
-
-              for (const row of dataRows) {
-                const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
-                if (cells.length < 3 || cells.every(c => !c)) continue;
-                // Skip "no data" messages
-                if (cells.some(c => /no se encontraron|sin resultados|no hay/i.test(c))) continue;
-                const obj = {};
-                headers.forEach((h, i) => { if (i < cells.length) obj[h] = cells[i]; });
-                results.push(obj);
+          const dateResult = await page.evaluate((range, from, to) => {
+            // Look for date range input
+            const inputs = document.querySelectorAll('input[type="text"], input.form-control, input[name*="fecha"], input[name*="date"]');
+            for (const input of inputs) {
+              // Date range inputs typically contain "DD/MM/YYYY - DD/MM/YYYY"
+              if (/\d{2}\/\d{2}\/\d{4}/.test(input.value) || input.id?.includes('fecha') || input.name?.includes('fecha')) {
+                const old = input.value;
+                // Use native setter to trigger change events
+                const nativeSet = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                nativeSet.call(input, range);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                // Also try jQuery trigger if available
+                if (window.jQuery) window.jQuery(input).trigger('change').trigger('apply.daterangepicker');
+                return { found: true, old, now: range, id: input.id, name: input.name };
               }
             }
-            return { rows: results, tableCount: tables.length };
-          }).catch(() => ({ rows: [], tableCount: 0 }));
+            return { found: false, inputCount: inputs.length };
+          }, dateRange, dateFrom, dateTo).catch(e => ({ found: false, err: e.message }));
 
-          compDebug.push(`E parsed: ${parsed.rows.length} rows`);
+          compDebug.push(`D2 date: ${JSON.stringify(dateResult)}`);
 
-          // Step F: Handle pagination
-          const allRows = [...parsed.rows];
-          let pg = 2;
-          while (pg <= 10) {
-            const hasNext = await page.evaluate(() => {
-              const n = document.querySelector('.paginate_button.next:not(.disabled)');
-              if (n) { n.click(); return true; } return false;
-            }).catch(() => false);
-            if (!hasNext) break;
-            await sleep(2000);
-            const more = await page.evaluate(() => {
-              const t = document.querySelector('table thead');
-              if (!t) return [];
-              const hs = Array.from(t.closest('table').querySelectorAll('thead th')).map(c => c.textContent.trim().toLowerCase());
-              return Array.from(t.closest('table').querySelectorAll('tbody tr')).map(r => {
-                const cs = Array.from(r.querySelectorAll('td')).map(c => c.textContent.trim());
-                if (cs.length < 3) return null;
-                const o = {}; hs.forEach((h, i) => { if (i < cs.length) o[h] = cs[i]; }); return o;
-              }).filter(Boolean);
-            }).catch(() => []);
-            if (more.length === 0) break;
-            allRows.push(...more);
-            pg++;
+          // Click search/buscar/consultar button if present
+          if (dateResult.found) {
+            await page.evaluate(() => {
+              const btns = Array.from(document.querySelectorAll('button, input[type="submit"], a.btn, .btn'));
+              const searchBtn = btns.find(b => /buscar|consultar|filtrar|search/i.test(b.textContent || b.value || ''));
+              if (searchBtn) { searchBtn.click(); return searchBtn.textContent.trim(); }
+              return null;
+            }).catch(() => {});
+            await sleep(5000); // wait for table to reload with new date range
           }
 
-          // Normalize
-          comprobantes = allRows.map((c, idx) => ({
-            id: `arca-${idx}-${Date.now()}`,
-            razonSocial: c['denominación emisor'] || c['denominacion emisor'] || c['emisor'] || 'Sin datos',
-            tipo: c['tipo'] || '',
-            nroComprobante: c['número'] || c['numero'] || '',
-            fecha: c['fecha'] || '',
-            importeTotal: c['imp. total'] || c['imp.total'] || c['importe total'] || '',
-          }));
+          // Step E: Download CSV/Excel from DataTables export buttons
+          compDebug.push('E: looking for export buttons and page content...');
+          await page.waitForSelector('table, .dt-buttons, .buttons-csv, .buttons-excel', { timeout: 10000 }).catch(() => {});
+          await sleep(3000);
+
+          // First, capture page state for debugging
+          const pageInfo = await page.evaluate(() => {
+            const body = document.body?.innerText?.slice(0, 1500) || '';
+            const btns = Array.from(document.querySelectorAll('button, a.btn, .dt-button, [class*="button"], a[href*="csv"], a[href*="excel"], a[href*="xls"]'));
+            const btnTexts = btns.map(b => ({ text: b.textContent.trim().slice(0, 50), tag: b.tagName, cls: b.className?.slice(0, 80), href: b.href || '' }));
+            const tables = document.querySelectorAll('table');
+            const tableInfo = Array.from(tables).map((t, i) => {
+              const ths = Array.from(t.querySelectorAll('thead th, tr:first-child th, tr:first-child td')).map(h => h.textContent.trim());
+              const trs = t.querySelectorAll('tbody tr');
+              const sample = trs.length > 0 ? Array.from(trs[0].querySelectorAll('td')).map(c => c.textContent.trim().slice(0, 40)) : [];
+              return { i, ths, rowCount: trs.length, sample };
+            });
+            return { body, btnTexts, tableInfo };
+          }).catch(() => ({ body: '', btnTexts: [], tableInfo: [] }));
+
+          compDebug.push(`E page body: ${pageInfo.body.slice(0, 400)}`);
+          compDebug.push(`E buttons: ${JSON.stringify(pageInfo.btnTexts.slice(0, 10))}`);
+          compDebug.push(`E tables: ${JSON.stringify(pageInfo.tableInfo)}`);
+
+          // Strategy 1: Try to find and click CSV/Excel export button
+          const downloadPath = '/tmp/arca-downloads';
+          const fs = require('fs');
+          if (!fs.existsSync(downloadPath)) fs.mkdirSync(downloadPath, { recursive: true });
+
+          // Set download behavior for the browser
+          const client = await page.target().createCDPSession();
+          await client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath });
+
+          const csvClicked = await page.evaluate(() => {
+            // Look for CSV/Excel/Download buttons
+            const btns = Array.from(document.querySelectorAll('button, a, .dt-button, [class*="button"]'));
+            const csvBtn = btns.find(b => /csv|excel|xls|exportar|descargar|download/i.test(b.textContent || b.className || ''));
+            if (csvBtn) { csvBtn.click(); return { found: true, text: csvBtn.textContent.trim().slice(0, 50) }; }
+            return { found: false };
+          }).catch(() => ({ found: false }));
+
+          compDebug.push(`E csv button: ${JSON.stringify(csvClicked)}`);
+
+          let csvData = null;
+          if (csvClicked.found) {
+            await sleep(5000); // wait for download
+            // Look for downloaded files
+            const files = fs.readdirSync(downloadPath).filter(f => /\.(csv|xls|xlsx)$/i.test(f));
+            compDebug.push(`E downloaded files: ${JSON.stringify(files)}`);
+            if (files.length > 0) {
+              const filePath = `${downloadPath}/${files[files.length - 1]}`;
+              if (filePath.endsWith('.csv')) {
+                csvData = fs.readFileSync(filePath, 'utf-8');
+                compDebug.push(`E csv rows: ${csvData.split('\n').length}`);
+              }
+            }
+          }
+
+          // Strategy 2: If CSV failed, parse HTML tables directly
+          if (csvData) {
+            // Parse CSV
+            const lines = csvData.split('\n').map(l => l.trim()).filter(l => l);
+            if (lines.length > 1) {
+              const headers = lines[0].split(/[,;]/).map(h => h.replace(/"/g, '').trim().toLowerCase());
+              for (let i = 1; i < lines.length; i++) {
+                const cells = lines[i].split(/[,;]/).map(c => c.replace(/"/g, '').trim());
+                if (cells.length < 3) continue;
+                const obj = {};
+                headers.forEach((h, j) => { if (j < cells.length) obj[h] = cells[j]; });
+                comprobantes.push({
+                  id: `arca-${i}-${Date.now()}`,
+                  razonSocial: obj['denominación emisor'] || obj['denominacion emisor'] || obj['emisor'] || obj['razon social'] || 'Sin datos',
+                  tipo: obj['tipo'] || obj['tipo comprobante'] || '',
+                  nroComprobante: obj['número'] || obj['numero'] || obj['nro comprobante'] || obj['punto de venta'] || '',
+                  fecha: obj['fecha'] || obj['fecha emision'] || '',
+                  importeTotal: obj['imp. total'] || obj['importe total'] || obj['total'] || obj['monto'] || '',
+                });
+              }
+            }
+            compDebug.push(`E from CSV: ${comprobantes.length} comprobantes`);
+          } else {
+            // Fallback: parse HTML tables
+            compDebug.push('E: no CSV, trying HTML parse...');
+            const parsed = await page.evaluate(() => {
+              const results = [];
+              const tables = document.querySelectorAll('table');
+              for (const table of tables) {
+                let headerRow = table.querySelector('thead tr') || table.querySelector('tr:first-child');
+                if (!headerRow) continue;
+                const headers = Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase());
+                if (headers.length < 3) continue;
+                const hasDate = headers.some(h => /fecha/i.test(h));
+                if (!hasDate) continue;
+                const dataRows = Array.from(table.querySelectorAll('tbody tr'));
+                for (const row of dataRows) {
+                  const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
+                  if (cells.length < 3 || cells.every(c => !c)) continue;
+                  if (cells.some(c => /no se encontraron|sin resultados|no hay datos/i.test(c))) continue;
+                  const obj = {};
+                  headers.forEach((h, i) => { if (i < cells.length) obj[h] = cells[i]; });
+                  results.push(obj);
+                }
+              }
+              return results;
+            }).catch(() => []);
+
+            comprobantes = parsed.map((c, idx) => ({
+              id: `arca-${idx}-${Date.now()}`,
+              razonSocial: c['denominación emisor'] || c['denominacion emisor'] || c['emisor'] || 'Sin datos',
+              tipo: c['tipo'] || '',
+              nroComprobante: c['número'] || c['numero'] || '',
+              fecha: c['fecha'] || '',
+              importeTotal: c['imp. total'] || c['imp.total'] || c['importe total'] || '',
+            }));
+            compDebug.push(`E from HTML: ${comprobantes.length} comprobantes`);
+          }
+
           compDebug.push(`FINAL: ${comprobantes.length} comprobantes`);
           console.log(`[complete] scraped ${comprobantes.length} comprobantes`);
         }
