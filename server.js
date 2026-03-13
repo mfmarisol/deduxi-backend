@@ -458,83 +458,60 @@ app.post('/api/arca/complete', async (req, res) => {
             await sleep(5000); // wait for table to reload with new date range
           }
 
-          // Step D3: Set DataTables to show ALL entries (avoid pagination)
-          await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
-          await sleep(2000);
-          const showAllResult = await page.evaluate(() => {
-            // DataTables "Show X entries" is typically a <select> with options like 10, 25, 50, 100, -1(All)
-            const selects = document.querySelectorAll('select[name*="length"], .dataTables_length select, select');
-            for (const sel of selects) {
-              const opts = Array.from(sel.options);
-              // Try to find "All" or highest value option
-              const allOpt = opts.find(o => /all|todos|-1/i.test(o.text) || o.value === '-1');
-              const maxOpt = opts.reduce((max, o) => (parseInt(o.value) > parseInt(max.value) ? o : max), opts[0]);
-              const chosen = allOpt || maxOpt;
-              if (chosen && opts.length > 1) {
-                sel.value = chosen.value;
-                sel.dispatchEvent(new Event('change', { bubbles: true }));
-                return { found: true, value: chosen.value, text: chosen.text, optCount: opts.length };
-              }
-            }
-            return { found: false, selectCount: selects.length };
-          }).catch(() => ({ found: false }));
-          compDebug.push(`D3 show all: ${JSON.stringify(showAllResult)}`);
-          if (showAllResult.found) await sleep(3000); // wait for table to re-render
-
-          // Step E: Extract ALL data using DataTables API (bypasses pagination)
-          compDebug.push('E: extracting data...');
+          // Step E: Parse HTML table + handle pagination (click Next)
+          compDebug.push('E: parsing table with pagination...');
           await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
           await sleep(3000);
 
-          const allData = await page.evaluate(() => {
-            // Strategy 1: Use DataTables API to get ALL rows (regardless of pagination)
-            if (window.jQuery && window.jQuery.fn.DataTable) {
-              try {
-                const tables = window.jQuery('table').filter(function() {
-                  return window.jQuery.fn.DataTable.isDataTable(this);
-                });
-                if (tables.length > 0) {
-                  const dt = tables.first().DataTable();
-                  const headers = [];
-                  dt.columns().header().each(function(h) { headers.push(h.textContent.trim().toLowerCase()); });
-                  const rows = [];
-                  // .rows().data() gets ALL rows, not just visible page
-                  dt.rows().data().each(function(row) {
-                    const obj = {};
-                    row.forEach((cell, i) => { if (i < headers.length) obj[headers[i]] = String(cell).trim(); });
-                    rows.push(obj);
-                  });
-                  return { method: 'datatables-api', rows, headers };
+          // Parse current page
+          const parseCurrentPage = async () => {
+            return page.evaluate(() => {
+              const tables = document.querySelectorAll('table');
+              for (const table of tables) {
+                const headerRow = table.querySelector('thead tr') || table.querySelector('tr:first-child');
+                if (!headerRow) continue;
+                const headers = Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase());
+                if (headers.length < 3 || !headers.some(h => /fecha/i.test(h))) continue;
+                const rows = [];
+                for (const row of table.querySelectorAll('tbody tr')) {
+                  const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
+                  if (cells.length < 3 || cells.every(c => !c)) continue;
+                  if (cells.some(c => /no se encontraron|sin resultados/i.test(c))) continue;
+                  const obj = {};
+                  headers.forEach((h, i) => { if (i < cells.length) obj[h] = cells[i]; });
+                  rows.push(obj);
                 }
-              } catch (e) { /* fall through */ }
-            }
-
-            // Strategy 2: Parse all HTML table rows (only gets current page)
-            const tables = document.querySelectorAll('table');
-            for (const table of tables) {
-              const headerRow = table.querySelector('thead tr') || table.querySelector('tr:first-child');
-              if (!headerRow) continue;
-              const headers = Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase());
-              if (headers.length < 3 || !headers.some(h => /fecha/i.test(h))) continue;
-              const rows = [];
-              for (const row of table.querySelectorAll('tbody tr')) {
-                const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
-                if (cells.length < 3 || cells.every(c => !c)) continue;
-                if (cells.some(c => /no se encontraron|sin resultados/i.test(c))) continue;
-                const obj = {};
-                headers.forEach((h, i) => { if (i < cells.length) obj[h] = cells[i]; });
-                rows.push(obj);
+                return { rows, headers };
               }
-              if (rows.length > 0) return { method: 'html-parse', rows, headers };
-            }
-            return { method: 'none', rows: [], headers: [] };
-          }).catch(() => ({ method: 'error', rows: [], headers: [] }));
+              return { rows: [], headers: [] };
+            }).catch(() => ({ rows: [], headers: [] }));
+          };
 
-          compDebug.push(`E method: ${allData.method}, rows: ${allData.rows.length}, headers: [${allData.headers.join(', ')}]`);
-          if (allData.rows.length > 0) compDebug.push(`E sample: ${JSON.stringify(allData.rows[0])}`);
+          const firstPage = await parseCurrentPage();
+          const allRows = [...firstPage.rows];
+          compDebug.push(`E page1: ${firstPage.rows.length} rows, headers: [${firstPage.headers.join(', ')}]`);
+
+          // Click "Next" for subsequent pages
+          let pageNum = 2;
+          while (pageNum <= 20 && allRows.length > 0) {
+            const hasNext = await page.evaluate(() => {
+              const nextBtn = document.querySelector('.paginate_button.next:not(.disabled), .next:not(.disabled) a, a.paginate_button.next:not(.disabled), li.next:not(.disabled) a');
+              if (nextBtn) { nextBtn.click(); return true; }
+              return false;
+            }).catch(() => false);
+            if (!hasNext) break;
+            await sleep(2000);
+            const nextPage = await parseCurrentPage();
+            if (nextPage.rows.length === 0) break;
+            allRows.push(...nextPage.rows);
+            compDebug.push(`E page${pageNum}: +${nextPage.rows.length} rows`);
+            pageNum++;
+          }
+
+          compDebug.push(`E total: ${allRows.length} rows`);
 
           // Normalize
-          comprobantes = allData.rows.map((c, idx) => ({
+          comprobantes = allRows.map((c, idx) => ({
             id: `arca-${idx}-${Date.now()}`,
             razonSocial: c['denominación emisor'] || c['denominacion emisor'] || c['emisor'] || 'Sin datos',
             tipo: c['tipo'] || '',
