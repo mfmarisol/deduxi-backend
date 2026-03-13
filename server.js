@@ -701,6 +701,61 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
       return res.json({ ok: false, error: 'session_expired_mcmp', msg: 'No se pudo autenticar en Mis Comprobantes.', debugLog, shot });
     }
 
+    // ── STEP 3b: Handle contribuyente selection page ──
+    // The page may show "Elegí una persona para ingresar" with a list of entities.
+    // We need to click through to the actual comprobantes.
+    // URL pattern: setearContribuyente.do?idContribuyente=0 → comprobantesRecibidos.do
+    if (/eleg[ií].*persona/i.test(bodyText) || /setearContribuyente/i.test(mcmpUrl) || /index\.do/i.test(mcmpUrl)) {
+      debugLog.push('Contribuyente selection page detected — selecting first entity...');
+      console.log('[comprobantes] Contribuyente selection page — navigating...');
+
+      // Try clicking the first contribuyente link/button, or navigate directly
+      const clicked = await page.evaluate(() => {
+        // Look for links that contain the contribuyente CUIT or "ingresar"
+        const links = Array.from(document.querySelectorAll('a[href*="setearContribuyente"], a[href*="contribuyente"], table a, .btn, button'));
+        for (const link of links) {
+          if (link.href && /setearContribuyente/i.test(link.href)) {
+            link.click();
+            return { clicked: true, href: link.href, text: link.textContent.trim() };
+          }
+        }
+        // Try any clickable row in a table
+        const tableLink = document.querySelector('table tbody tr a, table tbody tr td a');
+        if (tableLink) {
+          tableLink.click();
+          return { clicked: true, href: tableLink.href, text: tableLink.textContent.trim() };
+        }
+        return { clicked: false };
+      }).catch(() => ({ clicked: false }));
+
+      debugLog.push(`click result: ${JSON.stringify(clicked)}`);
+
+      if (clicked.clicked) {
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
+        await sleep(3000);
+      } else {
+        // Fallback: navigate directly to setearContribuyente.do?idContribuyente=0
+        debugLog.push('No clickable link found — trying direct URL...');
+        await page.goto('https://fes.afip.gob.ar/mcmp/jsp/setearContribuyente.do?idContribuyente=0', {
+          waitUntil: 'networkidle2', timeout: 20000,
+        }).catch(() => {});
+        await sleep(3000);
+      }
+
+      const afterSelectUrl = page.url();
+      const afterSelectTitle = await page.title().catch(() => '');
+      debugLog.push(`after selection: ${afterSelectUrl} (${afterSelectTitle})`);
+      console.log(`[comprobantes] after contribuyente selection: ${afterSelectUrl}`);
+
+      // Check again for session issues
+      const afterBody = await page.evaluate(() => document.body?.innerText?.slice(0, 300) || '').catch(() => '');
+      if (/sesi[oó]n.*expir/i.test(afterBody) || /no est[aá] logueado/i.test(afterBody)) {
+        debugLog.push('ERROR: Session expired after contribuyente selection');
+        const shot = await debugShot(page);
+        return res.json({ ok: false, error: 'session_expired_mcmp', msg: 'Sesión expiró al seleccionar contribuyente.', debugLog, shot });
+      }
+    }
+
     // ── STEP 4: Wait for DataTables to render ──
     await page.waitForSelector('table, .dataTables_wrapper, #tablaComprobantes', { timeout: 15000 }).catch(() => {});
     await sleep(2000);
