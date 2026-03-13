@@ -389,35 +389,26 @@ app.post('/api/arca/complete', async (req, res) => {
         compDebug.push(`A done: ok=${api.ok}, token=${!!api.token}, sign=${!!api.sign}, s1=${api.s1}, s2=${api.s2}, err=${api.err || 'none'}`);
 
         if (api.ok && api.token && api.sign) {
-          // Step B: POST sign+token to service URL
-          compDebug.push('B: POSTing token+sign via request interception...');
+          // Step B: POST sign+token via form.submit from about:blank
+          // (avoids both SPA interception AND request interception cookie issues)
+          compDebug.push('B: POSTing token+sign via form on blank page...');
           const svcUrl = api.url || 'https://fes.afip.gob.ar/mcmp/jsp/index.do';
-          const postData = `token=${encodeURIComponent(api.token)}&sign=${encodeURIComponent(api.sign)}`;
 
-          // Use Puppeteer request interception to do a real POST navigation
-          // (form.submit() gets swallowed by the portal SPA)
-          await page.setRequestInterception(true);
-          let interceptedNav = false;
-          const reqHandler = (request) => {
-            if (!interceptedNav && request.isNavigationRequest()) {
-              interceptedNav = true;
-              request.continue({
-                method: 'POST',
-                postData,
-                headers: { ...request.headers(), 'Content-Type': 'application/x-www-form-urlencoded' },
-              });
-            } else {
-              request.continue();
-            }
-          };
-          page.on('request', reqHandler);
-          try {
-            await page.goto(svcUrl, { waitUntil: 'networkidle2', timeout: 25000 });
-          } catch (navErr) {
-            compDebug.push(`B nav error: ${navErr.message}`);
-          }
-          page.off('request', reqHandler);
-          await page.setRequestInterception(false);
+          // Navigate to about:blank first (escapes portal SPA)
+          await page.goto('about:blank').catch(() => {});
+          // Inject a form and submit it
+          await page.setContent(`
+            <html><body>
+              <form id="ssoForm" method="POST" action="${svcUrl}">
+                <input type="hidden" name="token" value="${api.token}">
+                <input type="hidden" name="sign" value="${api.sign}">
+              </form>
+            </body></html>
+          `);
+          await Promise.all([
+            page.evaluate(() => document.getElementById('ssoForm').submit()),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {}),
+          ]).catch(() => {});
           await sleep(2000);
           compDebug.push(`B done: ${page.url()}`);
 
