@@ -599,184 +599,77 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
       return res.json({ ok: false, error: 'cuit_missing', msg: 'Falta el CUIT para consultar comprobantes.', debugLog });
     }
 
-    // ── STEP 1: Navigate to the ARCA portal (reuses auth cookies) ──
+    // ── STEP 1: Go to ARCA portal ──
+    debugLog.push('step1: navigating to portal...');
     await page.goto('https://portalcf.cloud.afip.gob.ar/portal/app/', {
       waitUntil: 'networkidle2', timeout: 30000,
-    });
-    await sleep(3000);
+    }).catch(e => debugLog.push('step1 error: ' + e.message));
+    await sleep(2000);
+    debugLog.push(`step1 done: ${page.url()}`);
 
-    const portalUrl = page.url();
-    const portalTitle = await page.title().catch(() => '');
-    debugLog.push(`portal: ${portalUrl} (${portalTitle})`);
-    console.log(`[comprobantes] portal loaded: ${portalTitle}`);
-
-    // ── STEP 2: Call portal API to get service info + sign/token ──
+    // ── STEP 2: Call portal APIs to get sign+token ──
+    debugLog.push('step2: calling portal APIs...');
     const apiResult = await page.evaluate(async (c) => {
       try {
-        // Step A: Get service info
         const r1 = await fetch(`/portal/api/servicios/${c}/servicio/mcmp`, { credentials: 'include' });
         const d1 = await r1.json();
-
-        // Step B: Get authorization token + sign
         const r2 = await fetch(`/portal/api/servicios/${c}/servicio/mcmp/autorizacion`, { credentials: 'include' });
         const d2 = await r2.json();
+        return { ok: true, url: d1?.servicio?.url, token: d2?.token, sign: d2?.sign, s1: r1.status, s2: r2.status };
+      } catch (e) { return { ok: false, err: e.message }; }
+    }, userCuit).catch(e => ({ ok: false, err: 'evaluate: ' + e.message }));
 
-        return {
-          ok: true,
-          serviceUrl: d1?.servicio?.url || null,
-          serviceName: d1?.servicio?.serviceName || null,
-          adherido: d1?.adherido,
-          token: d2?.token || null,
-          sign: d2?.sign || null,
-          hasToken: !!d2?.token,
-          hasSign: !!d2?.sign,
-          tokenLen: d2?.token?.length || 0,
-          signLen: d2?.sign?.length || 0,
-          r1Status: r1.status,
-          r2Status: r2.status,
-        };
-      } catch (e) {
-        return { ok: false, error: e.message };
-      }
-    }, userCuit);
+    debugLog.push(`step2: ok=${apiResult.ok}, token=${!!apiResult.token}, sign=${!!apiResult.sign}`);
 
-    debugLog.push(`API result: ok=${apiResult.ok}, hasToken=${apiResult.hasToken}, hasSign=${apiResult.hasSign}, tokenLen=${apiResult.tokenLen}, signLen=${apiResult.signLen}`);
-    console.log(`[comprobantes] API: ok=${apiResult.ok} token=${apiResult.hasToken} sign=${apiResult.hasSign}`);
-
-    if (!apiResult.ok) {
-      return res.json({ ok: false, error: 'api_error', msg: 'Error al autorizar Mis Comprobantes: ' + (apiResult.error || 'unknown'), debugLog });
+    if (!apiResult.ok || !apiResult.token || !apiResult.sign) {
+      const shot = await debugShot(page).catch(() => null);
+      return res.json({ ok: false, error: 'api_error', msg: 'Error obteniendo token: ' + (apiResult.err || 'sin token/sign'), debugLog, shot });
     }
 
-    if (!apiResult.hasToken || !apiResult.hasSign) {
-      debugLog.push('WARNING: No token/sign received — session may not be created');
-    }
+    // ── STEP 3: POST sign+token via form (mimics portal JS) ──
+    debugLog.push('step3: POSTing token+sign...');
+    const serviceUrl = apiResult.url || 'https://fes.afip.gob.ar/mcmp/jsp/index.do';
 
-    // ── STEP 3: POST sign+token to the service URL via hidden form ──
-    // Portal JS does: wn.postInNewTab(url, {token: t.getToken(), sign: t.getSign()})
-    // which creates a form with method=POST, target=_blank, fields: token, sign
-    // We use _self to stay in the same page (saves memory on Render free tier)
-    const serviceUrl = apiResult.serviceUrl || 'https://fes.afip.gob.ar/mcmp/jsp/index.do';
-    debugLog.push(`POSTing sign+token to: ${serviceUrl}`);
-    console.log(`[comprobantes] POSTing sign+token to: ${serviceUrl}`);
+    await page.evaluate((url, token, sign) => {
+      const f = document.createElement('form');
+      f.method = 'POST'; f.action = url; f.style.display = 'none';
+      [{n:'token',v:token},{n:'sign',v:sign}].forEach(({n,v}) => {
+        const i = document.createElement('input'); i.type='hidden'; i.name=n; i.value=v; f.appendChild(i);
+      });
+      document.body.appendChild(f); f.submit();
+    }, serviceUrl, apiResult.token, apiResult.sign).catch(e => debugLog.push('step3 form error: ' + e.message));
 
-    // Submit the form and wait for navigation
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
-      page.evaluate((url, token, sign) => {
-        const form = document.createElement('form');
-        form.method = 'POST';
-        form.action = url;
-        form.target = '_self';
-        form.style.display = 'none';
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+    await sleep(2000);
+    debugLog.push(`step3 done: ${page.url()}`);
 
-        const addField = (name, value) => {
-          const input = document.createElement('input');
-          input.type = 'hidden';
-          input.name = name;
-          input.value = value || '';
-          form.appendChild(input);
-        };
+    // ── STEP 4: Select contribuyente (always idContribuyente=0 = user's own CUIT) ──
+    debugLog.push('step4: selecting contribuyente...');
+    await page.goto('https://fes.afip.gob.ar/mcmp/jsp/setearContribuyente.do?idContribuyente=0', {
+      waitUntil: 'networkidle2', timeout: 20000,
+    }).catch(e => debugLog.push('step4 error: ' + e.message));
+    await sleep(2000);
+    debugLog.push(`step4 done: ${page.url()}`);
 
-        addField('token', token);
-        addField('sign', sign);
-
-        document.body.appendChild(form);
-        form.submit();
-      }, serviceUrl, apiResult.token, apiResult.sign),
-    ]);
-    await sleep(3000);
-
-    const mcmpUrl = page.url();
-    const mcmpTitle = await page.title().catch(() => '');
-    debugLog.push(`mcmp page: ${mcmpUrl} (${mcmpTitle})`);
-    console.log(`[comprobantes] mcmp: ${mcmpUrl} title: ${mcmpTitle}`);
-
-    // Check if we landed on the comprobantes page or got session error
-    const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || '').catch(() => '');
-    debugLog.push(`body preview: ${bodyText.slice(0, 200)}`);
-
-    if (/sesi[oó]n.*expir/i.test(bodyText) || /no est[aá] logueado/i.test(bodyText)) {
-      debugLog.push('ERROR: Session expired after POST');
-      const shot = await debugShot(page);
-      return res.json({ ok: false, error: 'session_expired_mcmp', msg: 'No se pudo autenticar en Mis Comprobantes.', debugLog, shot });
-    }
-
-    // ── STEP 3b: Handle contribuyente selection page ──
-    // Page shows "Elegí una persona para ingresar" with user's CUIT and entities they represent.
-    // We always select the user's own CUIT (idContribuyente=0 = first/self).
-    // After selection → comprobantesRecibidos.do
-    if (/eleg[ií].*persona/i.test(bodyText) || /index\.do/i.test(mcmpUrl)) {
-      debugLog.push('STEP 3b: Contribuyente selection page detected');
-      console.log('[comprobantes] Contribuyente selection — clicking user CUIT...');
-
-      // Navigate directly to setearContribuyente with idContribuyente=0 (self)
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {}),
-        page.goto('https://fes.afip.gob.ar/mcmp/jsp/setearContribuyente.do?idContribuyente=0', {
-          waitUntil: 'networkidle2', timeout: 20000,
-        }).catch(() => {}),
-      ]);
-      await sleep(3000);
-
-      const afterSelectUrl = page.url();
-      debugLog.push(`after contribuyente: ${afterSelectUrl}`);
-      console.log(`[comprobantes] after contribuyente: ${afterSelectUrl}`);
-    }
-
-    // ── STEP 3c: Make sure we're on Comprobantes Recibidos ──
-    // After contribuyente selection we should land on comprobantesRecibidos.do
-    // If not, navigate there explicitly
-    const currentUrl2 = page.url();
-    if (!/comprobantesRecibidos/i.test(currentUrl2)) {
-      debugLog.push('Not on recibidos page — navigating...');
-      console.log('[comprobantes] Navigating to comprobantesRecibidos...');
+    // ── STEP 5: Navigate to Comprobantes Recibidos ──
+    const curUrl = page.url();
+    if (!/comprobantesRecibidos/i.test(curUrl)) {
+      debugLog.push('step5: navigating to recibidos...');
       await page.goto('https://fes.afip.gob.ar/mcmp/jsp/comprobantesRecibidos.do', {
         waitUntil: 'networkidle2', timeout: 20000,
-      }).catch(() => {});
-      await sleep(3000);
-      debugLog.push(`now at: ${page.url()}`);
+      }).catch(e => debugLog.push('step5 error: ' + e.message));
+      await sleep(2000);
+      debugLog.push(`step5 done: ${page.url()}`);
+    } else {
+      debugLog.push('step5: already on recibidos');
     }
 
-    // ── STEP 3d: Set date filter to current month ──
-    // Date range picker: single input field with format "DD/MM/YYYY - DD/MM/YYYY"
-    const firstDay = `01/${month}/${year}`;
-    const lastDay = new Date(parseInt(year), parseInt(month), 0).getDate();
-    const lastDayStr = `${String(lastDay).padStart(2,'0')}/${month}/${year}`;
-    const dateRange = `${firstDay} - ${lastDayStr}`;
-    debugLog.push(`date filter: ${dateRange}`);
-    console.log(`[comprobantes] setting date filter: ${dateRange}`);
-
-    // Try to set the date range and trigger search
-    await page.evaluate((range) => {
-      // Look for date input (usually an input with daterangepicker or similar)
-      const dateInputs = document.querySelectorAll('input[name*="fecha"], input[name*="date"], input[type="text"], input.form-control');
-      for (const input of dateInputs) {
-        if (input.value && /\d{2}\/\d{2}\/\d{4}.*-.*\d{2}\/\d{2}\/\d{4}/.test(input.value)) {
-          // Found the date range input — update its value
-          const nativeSet = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-          nativeSet.call(input, range);
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-          return { found: true, oldValue: input.value };
-        }
-      }
-      return { found: false, inputCount: dateInputs.length };
-    }, dateRange).catch(() => ({}));
-
-    // Click search/buscar button if present
-    await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button, input[type="submit"], a.btn'));
-      const searchBtn = btns.find(b => /buscar|consultar|filtrar|search/i.test(b.textContent || b.value || ''));
-      if (searchBtn) searchBtn.click();
-    }).catch(() => {});
-    await sleep(3000);
-
     // Check for errors
-    const bodyText2 = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || '').catch(() => '');
-    if (/sesi[oó]n.*expir/i.test(bodyText2) || /no est[aá] logueado/i.test(bodyText2)) {
-      debugLog.push('ERROR: Session expired');
-      const shot = await debugShot(page);
-      return res.json({ ok: false, error: 'session_expired_mcmp', msg: 'Sesión expiró.', debugLog, shot });
+    const bodyCheck = await page.evaluate(() => document.body?.innerText?.slice(0, 300) || '').catch(() => '');
+    if (/sesi[oó]n.*expir/i.test(bodyCheck) || /no est[aá] logueado/i.test(bodyCheck)) {
+      debugLog.push('ERROR: session expired');
+      const shot = await debugShot(page).catch(() => null);
+      return res.json({ ok: false, error: 'session_expired', msg: 'Sesión expiró.', debugLog, shot });
     }
     debugLog.push(`ready to parse: ${page.url()}`);
 
