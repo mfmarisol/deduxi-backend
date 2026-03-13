@@ -592,9 +592,9 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
     }).catch(() => {});
     await sleep(3000);
 
-    // Wait for Angular to render
-    await page.waitForSelector('[ng-click], .card, [ng-repeat]', { timeout: 10000 }).catch(() => {});
-    await sleep(2000);
+    // Wait for page content to render
+    await page.waitForSelector('a, button, .card, [role="button"]', { timeout: 10000 }).catch(() => {});
+    await sleep(3000);
 
     const portalUrl = page.url();
     const portalTitle = await page.title().catch(() => '');
@@ -603,25 +603,42 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
     // Take screenshot of portal for debug
     const portalShot = await debugShot(page);
 
-    // ── STEP 2: Find all ng-click elements and locate "Mis Comprobantes" ──
+    // ── STEP 2: Find ALL clickable elements and dump portal structure ──
     const portalInfo = await page.evaluate(() => {
-      const cards = Array.from(document.querySelectorAll('[ng-click]'));
-      return cards.map(c => ({
-        text: c.textContent?.trim().slice(0, 80),
-        ngClick: c.getAttribute('ng-click')?.slice(0, 200),
-        x: Math.round(c.getBoundingClientRect().x + c.getBoundingClientRect().width / 2),
-        y: Math.round(c.getBoundingClientRect().y + c.getBoundingClientRect().height / 2),
-        w: Math.round(c.getBoundingClientRect().width),
-        h: Math.round(c.getBoundingClientRect().height),
-      })).filter(c => c.text && c.w > 0);
+      // Find all potentially clickable elements
+      const selectors = 'a, button, [role="button"], [onclick], [ng-click], [click], .card, [tabindex]';
+      const els = Array.from(document.querySelectorAll(selectors));
+      return els.map(c => {
+        const r = c.getBoundingClientRect();
+        return {
+          tag: c.tagName,
+          text: c.textContent?.trim().slice(0, 80),
+          href: c.getAttribute('href')?.slice(0, 200) || '',
+          onclick: c.getAttribute('onclick')?.slice(0, 200) || '',
+          ngClick: c.getAttribute('ng-click')?.slice(0, 200) || '',
+          cls: c.className?.toString().slice(0, 100) || '',
+          x: Math.round(r.x + r.width / 2),
+          y: Math.round(r.y + r.height / 2),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+        };
+      }).filter(c => c.text && c.w > 0 && c.h > 0);
     }).catch(() => []);
 
-    debugLog.push(`ng-click elements: ${portalInfo.length}`);
-    portalInfo.forEach((p, i) => debugLog.push(`  [${i}] "${p.text.slice(0,40)}" ng-click="${(p.ngClick||'').slice(0,60)}" at (${p.x},${p.y})`));
-    console.log('[comprobantes] portal elements:', JSON.stringify(portalInfo.slice(0, 10)));
+    debugLog.push(`clickable elements: ${portalInfo.length}`);
+    // Log elements that mention "comprobante" or look like service cards
+    const relevant = portalInfo.filter(p =>
+      /comprobante/i.test(p.text) || /comprobante/i.test(p.href) || /comprobante/i.test(p.onclick)
+    );
+    relevant.forEach((p, i) => debugLog.push(`  match[${i}] <${p.tag}> "${p.text.slice(0,50)}" href="${p.href.slice(0,80)}" at (${p.x},${p.y}) ${p.w}x${p.h}`));
+    if (relevant.length === 0) {
+      // Log first 15 elements for debug
+      portalInfo.slice(0, 15).forEach((p, i) => debugLog.push(`  el[${i}] <${p.tag}> "${p.text.slice(0,40)}" href="${p.href.slice(0,50)}" cls="${p.cls.slice(0,40)}" at (${p.x},${p.y})`));
+    }
+    console.log('[comprobantes] relevant:', JSON.stringify(relevant));
+    console.log('[comprobantes] all clickable:', portalInfo.length);
 
     // ── STEP 3: Intercept window.open + monitor network requests ──
-    const capturedUrls = [];
     await page.evaluate(() => {
       window.__capturedOpenUrl = null;
       const origOpen = window.open;
@@ -632,55 +649,72 @@ app.post('/api/arca/fetch-comprobantes', async (req, res) => {
       };
     });
 
-    // Monitor network for redirect URLs (the portal API returns service URLs)
+    // Monitor ALL network requests after click
     const networkUrls = [];
     const requestHandler = (request) => {
       const url = request.url();
-      if (/rcel|comprobante|fe\.afip/i.test(url)) {
+      // Capture any request to ARCA services or comprobantes-related URLs
+      if (/rcel|comprobante|fe\.afip|servicios.*redirect|mis.*comp/i.test(url)) {
         networkUrls.push(url);
         console.log(`[comprobantes] network: ${url}`);
       }
     };
     page.on('request', requestHandler);
 
-    // ── STEP 4: Click "Mis Comprobantes" ──
-    // First try: find by ng-click containing comprobante
+    // ── STEP 4: Click "Mis Comprobantes" — use REAL mouse click ──
     let clickedOk = false;
-    const compEl = portalInfo.find(p => /comprobante/i.test(p.ngClick || ''));
-    if (compEl && compEl.x > 0 && compEl.y > 0) {
-      debugLog.push(`clicking ng-click element at (${compEl.x}, ${compEl.y}): "${compEl.text.slice(0,40)}"`);
-      await page.mouse.click(compEl.x, compEl.y);
+
+    // Try 1: find element by text match "Mis Comprobantes" and get coordinates
+    if (relevant.length > 0) {
+      const target = relevant[0];
+      debugLog.push(`clicking relevant[0] at (${target.x}, ${target.y}): "${target.text.slice(0,40)}"`);
+      await page.mouse.click(target.x, target.y);
       clickedOk = true;
     }
 
-    // Second try: find by text content
+    // Try 2: search ALL elements for text "Mis Comprobantes" (not just a/button)
     if (!clickedOk) {
-      const textEl = portalInfo.find(p => /mis\s*comprobantes/i.test(p.text));
-      if (textEl && textEl.x > 0 && textEl.y > 0) {
-        debugLog.push(`clicking text element at (${textEl.x}, ${textEl.y}): "${textEl.text.slice(0,40)}"`);
-        await page.mouse.click(textEl.x, textEl.y);
+      const coords = await page.evaluate(() => {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        while (walker.nextNode()) {
+          const node = walker.currentNode;
+          if (/mis\s*comprobantes/i.test(node.textContent?.trim()) && node.textContent.trim().length < 30) {
+            const el = node.parentElement;
+            if (el) {
+              const r = el.getBoundingClientRect();
+              if (r.width > 0 && r.height > 0) {
+                return { x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2), text: el.textContent.trim().slice(0, 50), tag: el.tagName };
+              }
+            }
+          }
+        }
+        return null;
+      }).catch(() => null);
+
+      if (coords) {
+        debugLog.push(`clicking text node at (${coords.x}, ${coords.y}): "${coords.text}" <${coords.tag}>`);
+        await page.mouse.click(coords.x, coords.y);
         clickedOk = true;
       }
     }
 
-    // Third try: JS click fallback
+    // Try 3: JS click fallback
     if (!clickedOk) {
       const jsResult = await page.evaluate(() => {
         const allEls = Array.from(document.querySelectorAll('*'));
-        const el = allEls.find(e => /^mis\s*comprobantes$/i.test(e.textContent?.trim()) && e.children.length === 0);
+        const el = allEls.find(e => /mis\s*comprobantes/i.test(e.textContent?.trim()) && e.textContent.trim().length < 30);
         if (el) {
-          const c = el.closest('[ng-click]') || el;
-          c.click();
-          return 'JS click: ' + el.textContent.trim();
+          el.click();
+          return 'JS click: ' + el.textContent.trim() + ' <' + el.tagName + '>';
         }
         return null;
       }).catch(() => null);
       debugLog.push(jsResult || 'no element found to click');
     }
 
-    // Wait for navigation/popup/network
+    // Wait for the click to take effect (navigation/popup/network)
     await sleep(6000);
-    page.removeListener('request', requestHandler);
+    page.off('request', requestHandler);
 
     // Check what we captured
     const capturedUrl = await page.evaluate(() => window.__capturedOpenUrl).catch(() => null);
