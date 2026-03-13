@@ -481,122 +481,67 @@ app.post('/api/arca/complete', async (req, res) => {
           compDebug.push(`D3 show all: ${JSON.stringify(showAllResult)}`);
           if (showAllResult.found) await sleep(3000); // wait for table to re-render
 
-          // Step E: Download CSV/Excel from DataTables export buttons
-          compDebug.push('E: looking for export buttons and page content...');
-          await page.waitForSelector('table', { timeout: 5000 }).catch(() => {});
-          await sleep(2000);
+          // Step E: Extract ALL data using DataTables API (bypasses pagination)
+          compDebug.push('E: extracting data...');
+          await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
+          await sleep(3000);
 
-          // First, capture page state for debugging
-          const pageInfo = await page.evaluate(() => {
-            const body = document.body?.innerText?.slice(0, 1500) || '';
-            const btns = Array.from(document.querySelectorAll('button, a.btn, .dt-button, [class*="button"], a[href*="csv"], a[href*="excel"], a[href*="xls"]'));
-            const btnTexts = btns.map(b => ({ text: b.textContent.trim().slice(0, 50), tag: b.tagName, cls: b.className?.slice(0, 80), href: b.href || '' }));
-            const tables = document.querySelectorAll('table');
-            const tableInfo = Array.from(tables).map((t, i) => {
-              const ths = Array.from(t.querySelectorAll('thead th, tr:first-child th, tr:first-child td')).map(h => h.textContent.trim());
-              const trs = t.querySelectorAll('tbody tr');
-              const sample = trs.length > 0 ? Array.from(trs[0].querySelectorAll('td')).map(c => c.textContent.trim().slice(0, 40)) : [];
-              return { i, ths, rowCount: trs.length, sample };
-            });
-            return { body, btnTexts, tableInfo };
-          }).catch(() => ({ body: '', btnTexts: [], tableInfo: [] }));
-
-          compDebug.push(`E page body: ${pageInfo.body.slice(0, 400)}`);
-          compDebug.push(`E buttons: ${JSON.stringify(pageInfo.btnTexts.slice(0, 10))}`);
-          compDebug.push(`E tables: ${JSON.stringify(pageInfo.tableInfo)}`);
-
-          // Strategy 1: Try to find and click CSV/Excel export button
-          const downloadPath = '/tmp/arca-downloads';
-          const fs = require('fs');
-          if (!fs.existsSync(downloadPath)) fs.mkdirSync(downloadPath, { recursive: true });
-
-          // Set download behavior for the browser
-          const client = await page.target().createCDPSession();
-          await client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath });
-
-          const csvClicked = await page.evaluate(() => {
-            // Look for CSV/Excel/Download buttons
-            const btns = Array.from(document.querySelectorAll('button, a, .dt-button, [class*="button"]'));
-            const csvBtn = btns.find(b => /csv|excel|xls|exportar|descargar|download/i.test(b.textContent || b.className || ''));
-            if (csvBtn) { csvBtn.click(); return { found: true, text: csvBtn.textContent.trim().slice(0, 50) }; }
-            return { found: false };
-          }).catch(() => ({ found: false }));
-
-          compDebug.push(`E csv button: ${JSON.stringify(csvClicked)}`);
-
-          let csvData = null;
-          if (csvClicked.found) {
-            await sleep(5000); // wait for download
-            // Look for downloaded files
-            const files = fs.readdirSync(downloadPath).filter(f => /\.(csv|xls|xlsx)$/i.test(f));
-            compDebug.push(`E downloaded files: ${JSON.stringify(files)}`);
-            if (files.length > 0) {
-              const filePath = `${downloadPath}/${files[files.length - 1]}`;
-              if (filePath.endsWith('.csv')) {
-                csvData = fs.readFileSync(filePath, 'utf-8');
-                compDebug.push(`E csv rows: ${csvData.split('\n').length}`);
-              }
-            }
-          }
-
-          // Strategy 2: If CSV failed, parse HTML tables directly
-          if (csvData) {
-            // Parse CSV
-            const lines = csvData.split('\n').map(l => l.trim()).filter(l => l);
-            if (lines.length > 1) {
-              const headers = lines[0].split(/[,;]/).map(h => h.replace(/"/g, '').trim().toLowerCase());
-              for (let i = 1; i < lines.length; i++) {
-                const cells = lines[i].split(/[,;]/).map(c => c.replace(/"/g, '').trim());
-                if (cells.length < 3) continue;
-                const obj = {};
-                headers.forEach((h, j) => { if (j < cells.length) obj[h] = cells[j]; });
-                comprobantes.push({
-                  id: `arca-${i}-${Date.now()}`,
-                  razonSocial: obj['denominación emisor'] || obj['denominacion emisor'] || obj['emisor'] || obj['razon social'] || 'Sin datos',
-                  tipo: obj['tipo'] || obj['tipo comprobante'] || '',
-                  nroComprobante: obj['número'] || obj['numero'] || obj['nro comprobante'] || obj['punto de venta'] || '',
-                  fecha: obj['fecha'] || obj['fecha emision'] || '',
-                  importeTotal: obj['imp. total'] || obj['importe total'] || obj['total'] || obj['monto'] || '',
+          const allData = await page.evaluate(() => {
+            // Strategy 1: Use DataTables API to get ALL rows (regardless of pagination)
+            if (window.jQuery && window.jQuery.fn.DataTable) {
+              try {
+                const tables = window.jQuery('table').filter(function() {
+                  return window.jQuery.fn.DataTable.isDataTable(this);
                 });
-              }
-            }
-            compDebug.push(`E from CSV: ${comprobantes.length} comprobantes`);
-          } else {
-            // Fallback: parse HTML tables
-            compDebug.push('E: no CSV, trying HTML parse...');
-            const parsed = await page.evaluate(() => {
-              const results = [];
-              const tables = document.querySelectorAll('table');
-              for (const table of tables) {
-                let headerRow = table.querySelector('thead tr') || table.querySelector('tr:first-child');
-                if (!headerRow) continue;
-                const headers = Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase());
-                if (headers.length < 3) continue;
-                const hasDate = headers.some(h => /fecha/i.test(h));
-                if (!hasDate) continue;
-                const dataRows = Array.from(table.querySelectorAll('tbody tr'));
-                for (const row of dataRows) {
-                  const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
-                  if (cells.length < 3 || cells.every(c => !c)) continue;
-                  if (cells.some(c => /no se encontraron|sin resultados|no hay datos/i.test(c))) continue;
-                  const obj = {};
-                  headers.forEach((h, i) => { if (i < cells.length) obj[h] = cells[i]; });
-                  results.push(obj);
+                if (tables.length > 0) {
+                  const dt = tables.first().DataTable();
+                  const headers = [];
+                  dt.columns().header().each(function(h) { headers.push(h.textContent.trim().toLowerCase()); });
+                  const rows = [];
+                  // .rows().data() gets ALL rows, not just visible page
+                  dt.rows().data().each(function(row) {
+                    const obj = {};
+                    row.forEach((cell, i) => { if (i < headers.length) obj[headers[i]] = String(cell).trim(); });
+                    rows.push(obj);
+                  });
+                  return { method: 'datatables-api', rows, headers };
                 }
-              }
-              return results;
-            }).catch(() => []);
+              } catch (e) { /* fall through */ }
+            }
 
-            comprobantes = parsed.map((c, idx) => ({
-              id: `arca-${idx}-${Date.now()}`,
-              razonSocial: c['denominación emisor'] || c['denominacion emisor'] || c['emisor'] || 'Sin datos',
-              tipo: c['tipo'] || '',
-              nroComprobante: c['número'] || c['numero'] || '',
-              fecha: c['fecha'] || '',
-              importeTotal: c['imp. total'] || c['imp.total'] || c['importe total'] || '',
-            }));
-            compDebug.push(`E from HTML: ${comprobantes.length} comprobantes`);
-          }
+            // Strategy 2: Parse all HTML table rows (only gets current page)
+            const tables = document.querySelectorAll('table');
+            for (const table of tables) {
+              const headerRow = table.querySelector('thead tr') || table.querySelector('tr:first-child');
+              if (!headerRow) continue;
+              const headers = Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim().toLowerCase());
+              if (headers.length < 3 || !headers.some(h => /fecha/i.test(h))) continue;
+              const rows = [];
+              for (const row of table.querySelectorAll('tbody tr')) {
+                const cells = Array.from(row.querySelectorAll('td')).map(c => c.textContent.trim());
+                if (cells.length < 3 || cells.every(c => !c)) continue;
+                if (cells.some(c => /no se encontraron|sin resultados/i.test(c))) continue;
+                const obj = {};
+                headers.forEach((h, i) => { if (i < cells.length) obj[h] = cells[i]; });
+                rows.push(obj);
+              }
+              if (rows.length > 0) return { method: 'html-parse', rows, headers };
+            }
+            return { method: 'none', rows: [], headers: [] };
+          }).catch(() => ({ method: 'error', rows: [], headers: [] }));
+
+          compDebug.push(`E method: ${allData.method}, rows: ${allData.rows.length}, headers: [${allData.headers.join(', ')}]`);
+          if (allData.rows.length > 0) compDebug.push(`E sample: ${JSON.stringify(allData.rows[0])}`);
+
+          // Normalize
+          comprobantes = allData.rows.map((c, idx) => ({
+            id: `arca-${idx}-${Date.now()}`,
+            razonSocial: c['denominación emisor'] || c['denominacion emisor'] || c['emisor'] || 'Sin datos',
+            tipo: c['tipo'] || '',
+            nroComprobante: c['número'] || c['numero'] || '',
+            fecha: c['fecha'] || '',
+            importeTotal: c['imp. total'] || c['imp.total'] || c['importe total'] || '',
+          }));
 
           compDebug.push(`FINAL: ${comprobantes.length} comprobantes`);
           console.log(`[complete] scraped ${comprobantes.length} comprobantes`);
