@@ -363,9 +363,6 @@ app.post('/api/arca/complete', async (req, res) => {
       let comprobantes = [];
       try {
         console.log('[complete] scraping comprobantes immediately...');
-        const now = new Date();
-        const yr = now.getFullYear();
-        const mo = String(now.getMonth() + 1).padStart(2, '0');
 
         // Step A: We're already on the portal — call APIs to get sign+token
         compDebug.push('A: calling portal APIs...');
@@ -417,59 +414,9 @@ app.post('/api/arca/complete', async (req, res) => {
             compDebug.push(`D done: ${page.url()}`);
           }
 
-          // Step D2: Use jQuery daterangepicker API to set full month range
-          // The default range is just yesterday — we want 01/MM/YYYY to today
-          const today = new Date();
-          const dateFrom = `01/${mo}/${yr}`;
-          const dateTo = `${String(today.getDate()).padStart(2,'0')}/${String(today.getMonth()+1).padStart(2,'0')}/${today.getFullYear()}`;
-          compDebug.push(`D2: setting date ${dateFrom} to ${dateTo}`);
-
-          const dateResult = await page.evaluate((from, to) => {
-            try {
-              const $ = window.jQuery;
-              if (!$) return { ok: false, reason: 'no jQuery' };
-              // Find the daterangepicker input
-              const drpInput = $('input[name*="fecha"], input.daterangepicker-input, input[id*="fecha"]').first();
-              if (!drpInput.length) {
-                // Try any input with a daterangepicker attached
-                const allInputs = $('input').filter(function() { return $(this).data('daterangepicker'); });
-                if (!allInputs.length) return { ok: false, reason: 'no daterangepicker input found' };
-                const drp = allInputs.first().data('daterangepicker');
-                const moment = window.moment;
-                if (drp && moment) {
-                  drp.setStartDate(moment(from, 'DD/MM/YYYY'));
-                  drp.setEndDate(moment(to, 'DD/MM/YYYY'));
-                  allInputs.first().trigger('apply.daterangepicker', drp);
-                  return { ok: true, method: 'drp-api-filtered' };
-                }
-                return { ok: false, reason: 'no drp data on filtered inputs' };
-              }
-              const drp = drpInput.data('daterangepicker');
-              const moment = window.moment;
-              if (drp && moment) {
-                drp.setStartDate(moment(from, 'DD/MM/YYYY'));
-                drp.setEndDate(moment(to, 'DD/MM/YYYY'));
-                drpInput.trigger('apply.daterangepicker', drp);
-                return { ok: true, method: 'drp-api' };
-              }
-              return { ok: false, reason: 'no drp or moment' };
-            } catch(e) { return { ok: false, reason: e.message }; }
-          }, dateFrom, dateTo).catch(e => ({ ok: false, reason: e.message }));
-
-          compDebug.push(`D2 result: ${JSON.stringify(dateResult)}`);
-
-          if (dateResult.ok) {
-            // Click Buscar to reload table with new date range
-            await page.evaluate(() => {
-              const btns = Array.from(document.querySelectorAll('button, input[type="submit"], a.btn, .btn'));
-              const searchBtn = btns.find(b => /buscar|consultar|filtrar|search/i.test(b.textContent || b.value || ''));
-              if (searchBtn) searchBtn.click();
-            }).catch(() => {});
-            await sleep(5000);
-          } else {
-            compDebug.push('D2 skipped — using default date range');
-            // Default date range still shows comprobantes, so we proceed
-          }
+          // Step D2: REMOVED — changing the daterangepicker breaks the table reload.
+          // The default date range already shows comprobantes. We'll parse whatever is shown.
+          compDebug.push('D2: skipped (using default date range)');
 
           // Step E: Parse HTML table + handle pagination (click Next)
           compDebug.push('E: parsing table with pagination...');
