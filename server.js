@@ -351,7 +351,8 @@ app.post('/api/arca/complete', async (req, res) => {
 
     const url = page.url();
     console.log('[complete] after submit, url:', url);
-    const loginSucceeded = !url.includes('login.xhtml');
+    // Check login success: must NOT be on any auth.afip.gob.ar page
+    const loginSucceeded = !url.includes('auth.afip.gob.ar');
 
     if (loginSucceeded) {
       console.log(`[complete] login OK, landing: ${url}`);
